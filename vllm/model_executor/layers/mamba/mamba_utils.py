@@ -228,8 +228,8 @@ class MambaStateShapeCalculator:
 
         temporal_state_shape = (
             divide(num_v_heads, tp_world_size),
-            head_v_dim,
             head_k_dim,
+            head_v_dim,
         )
         return conv_state_shape, temporal_state_shape
 
