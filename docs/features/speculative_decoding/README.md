@@ -15,6 +15,7 @@ vLLM supports a variety of methods of speculative decoding. Model-based methods 
 - [Multi-Layer Perceptron](mlp.md)
 - [N-Gram](n_gram.md)
 - [Suffix Decoding](suffix.md)
+- [Self-SWA](self_swa.md)
 
 ## Method Selection at a Glance
 
@@ -30,6 +31,7 @@ depend on your model family, traffic pattern, hardware, and sampling settings.
 | MLP speculator | Medium to high gain | Medium gain | Good when compatible MLP speculators are available. |
 | N-gram | Low to medium gain | Medium gain | Lightweight and easy to enable. |
 | Suffix decoding | Low to medium gain | Medium gain | No extra draft model; dynamic speculation depth. |
+| Self-SWA | Experimental | Experimental | Greedy-only target-model drafter with sliding-window decode on ROCm AITER. |
 
 For reproducible measurements in your environment, use
 [`examples/features/speculative_decoding/spec_decode_offline.py`](../../../examples/features/speculative_decoding/spec_decode_offline.py)

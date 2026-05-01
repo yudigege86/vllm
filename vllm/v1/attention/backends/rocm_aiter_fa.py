@@ -10,6 +10,7 @@ import torch
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.cache import CacheDType
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.platforms import current_platform
@@ -35,6 +36,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
+_SELF_SWA_FORWARD_CONTEXT_KEY = "self_swa_sliding_window"
 if current_platform.is_rocm():
     from vllm.triton_utils import tl, triton
 
@@ -860,6 +862,15 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 "cross-attention."
             )
 
+    def _get_effective_sliding_window(self) -> tuple[int, int]:
+        try:
+            forward_context = get_forward_context()
+        except AssertionError:
+            return self.sliding_window
+        return forward_context.additional_kwargs.get(
+            _SELF_SWA_FORWARD_CONTEXT_KEY, self.sliding_window
+        )
+
     def extend_for_sliding_window(
         self,
         attn_metadata: AiterFlashAttentionMetadata,
@@ -872,6 +883,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
         block_table: torch.Tensor,
         k_scale: float,
         v_scale: float,
+        sliding_window: tuple[int, int],
     ):
         assert attn_metadata.extend_metadata is not None
         assert attn_metadata.extend_metadata.chunk_context_metadata is not None
@@ -915,7 +927,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
             dropout_p=0.0,
             softmax_scale=self.scale,
             causal=True,
-            window_size=self.sliding_window,
+            window_size=sliding_window,
             alibi_slopes=self.alibi_slopes,
             return_lse=False,
             out=output,
@@ -938,8 +950,9 @@ class AiterFlashAttentionImpl(AttentionImpl):
         slot_mapping: torch.Tensor,
         k_scale: torch.Tensor,
         v_scale: torch.Tensor,
+        sliding_window: tuple[int, int],
     ):
-        if self.sliding_window[0] != -1:
+        if sliding_window[0] != -1:
             self.extend_for_sliding_window(
                 attn_metadata,
                 query,
@@ -951,6 +964,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 block_table,
                 k_scale,
                 v_scale,
+                sliding_window,
             )
             return
         out, lse = rocm_aiter_ops.flash_attn_varlen_func(
@@ -965,7 +979,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
             dropout_p=0.0,
             softmax_scale=self.scale,
             causal=True,
-            window_size=self.sliding_window,
+            window_size=sliding_window,
             alibi_slopes=self.alibi_slopes,
             return_lse=True,
         )
@@ -1012,7 +1026,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 dropout_p=0.0,
                 softmax_scale=self.scale,
                 causal=False,
-                window_size=self.sliding_window,
+                window_size=sliding_window,
                 alibi_slopes=self.alibi_slopes,
                 return_lse=True,
             )
@@ -1088,6 +1102,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
         # Whenever making a change in this method, please benchmark the
         # performance to make sure it does not introduce any overhead.
         num_actual_tokens = attn_metadata.num_actual_tokens
+        sliding_window = self._get_effective_sliding_window()
         key_cache, value_cache = kv_cache.unbind(0)
 
         if is_quantized_kv_cache(self.kv_cache_dtype):
@@ -1130,7 +1145,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     dropout_p=0.0,
                     softmax_scale=self.scale,
                     causal=attn_metadata.causal,
-                    window_size=self.sliding_window,
+                    window_size=sliding_window,
                     alibi_slopes=self.alibi_slopes,
                     out=output_actual_tokens[num_decode_tokens + num_extend_tokens :],
                 )
@@ -1170,6 +1185,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     ],
                     k_scale=k_scale,
                     v_scale=v_scale,
+                    sliding_window=sliding_window,
                 )
 
             # calculate for decodes
@@ -1202,7 +1218,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                             cache_seqlens=attn_metadata.seq_lens[:num_decodes],
                             softmax_scale=self.scale,
                             causal=attn_metadata.causal,
-                            window_size=self.sliding_window,
+                            window_size=sliding_window,
                             softcap=self.logits_soft_cap,
                             q_descale=None,
                             k_descale=layer._k_scale.expand(descale_shape),
@@ -1242,7 +1258,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                             softmax_scale=self.scale,
                             causal=True,
                             alibi_slopes=self.alibi_slopes,
-                            window_size=self.sliding_window,
+                            window_size=sliding_window,
                             block_table=attn_metadata.block_table[:num_decodes],
                             softcap=self.logits_soft_cap,
                             q_descale=None,
@@ -1287,7 +1303,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         softmax_scale=self.scale,
                         causal=True,
                         alibi_slopes=self.alibi_slopes,
-                        window_size=self.sliding_window,
+                        window_size=sliding_window,
                         block_table=attn_metadata.block_table[:num_decodes],
                         softcap=self.logits_soft_cap,
                         q_descale=None,
@@ -1396,7 +1412,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         None,
                         _PARTITION_SIZE_ROCM,
                         1,
-                        self.sliding_window[0] + 1,
+                        sliding_window[0] + 1,
                     )
         else:
             raise NotImplementedError(

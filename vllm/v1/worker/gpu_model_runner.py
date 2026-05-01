@@ -177,6 +177,7 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
     update_ngram_gpu_tensors_incremental,
     update_scheduler_for_invalid_drafts,
 )
+from vllm.v1.spec_decode.self_swa import SelfSWAProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
@@ -524,6 +525,7 @@ class GPUModelRunner(
                 | DraftModelProposer
                 | MedusaProposer
                 | ExtractHiddenStatesProposer
+                | SelfSWAProposer
             )
             if self.speculative_config.method == "ngram":
                 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
@@ -531,6 +533,12 @@ class GPUModelRunner(
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.uses_draft_model():
                 self.drafter = DraftModelProposer(
+                    vllm_config=self.vllm_config,
+                    device=self.device,
+                    runner=self,
+                )
+            elif self.speculative_config.use_self_swa():
+                self.drafter = SelfSWAProposer(
                     vllm_config=self.vllm_config,
                     device=self.device,
                     runner=self,
@@ -4233,6 +4241,7 @@ class GPUModelRunner(
                 spec_config.use_eagle()
                 or spec_config.uses_draft_model()
                 or spec_config.uses_extract_hidden_states()
+                or spec_config.use_self_swa()
             ) and not spec_config.disable_padded_drafter_batch
             if use_gpu_toks:
                 # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
@@ -4242,7 +4251,8 @@ class GPUModelRunner(
                     EagleProposer
                     | DFlashProposer
                     | DraftModelProposer
-                    | ExtractHiddenStatesProposer,
+                    | ExtractHiddenStatesProposer
+                    | SelfSWAProposer,
                 )
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
@@ -4636,9 +4646,11 @@ class GPUModelRunner(
             spec_config.use_eagle()
             or spec_config.use_dflash()
             or spec_config.uses_draft_model()
+            or spec_config.use_self_swa()
         ):
             assert isinstance(
-                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
+                self.drafter,
+                EagleProposer | DFlashProposer | DraftModelProposer | SelfSWAProposer,
             )
 
             if spec_config.disable_padded_drafter_batch:
@@ -4889,7 +4901,7 @@ class GPUModelRunner(
             prepare_communication_buffer_for_model(self.model)
             if (drafter := getattr(self, "drafter", None)) and (
                 drafter_model := getattr(drafter, "model", None)
-            ):
+            ) and drafter_model is not self.model:
                 prepare_communication_buffer_for_model(drafter_model)
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
@@ -6340,9 +6352,11 @@ class GPUModelRunner(
         if self.speculative_config and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_draft_model()
+            or self.speculative_config.use_self_swa()
         ):
             assert isinstance(
-                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
+                self.drafter,
+                EagleProposer | DFlashProposer | DraftModelProposer | SelfSWAProposer,
             )
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 

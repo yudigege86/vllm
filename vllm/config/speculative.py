@@ -61,6 +61,7 @@ SpeculativeMethod = Literal[
     "medusa",
     "mlp_speculator",
     "draft_model",
+    "self_swa",
     "suffix",
     EagleModelTypes,
     NgramGPUTypes,
@@ -529,6 +530,9 @@ class SpeculativeConfig:
                 # --quantization fp8 with a bf16 checkpoint.
                 if not self.quantization:
                     self.quantization = self.target_model_config.quantization
+            elif self.method == "self_swa":
+                if self.target_model_config is None:
+                    raise ValueError("target_model_config must be present for self_swa")
             elif self.method in ("ngram", "[ngram]"):
                 self.model = "ngram"
             elif self.method == "ngram_gpu":
@@ -545,7 +549,23 @@ class SpeculativeConfig:
         if self.method in ("ngram", "[ngram]"):
             self.method = "ngram"
 
-        if self.method in ("ngram", "ngram_gpu"):
+        if self.method == "self_swa":
+            if self.model is not None:
+                raise ValueError("self_swa uses the target model; do not set model.")
+            if self.target_model_config is None:
+                raise ValueError("target_model_config must be present for self_swa")
+            if self.target_parallel_config is None:
+                raise ValueError("target_parallel_config must be present for self_swa")
+            self.prompt_lookup_max = 0
+            self.prompt_lookup_min = 0
+            self.draft_model_config = self.target_model_config
+            self.draft_parallel_config = self.target_parallel_config
+            if self.draft_sample_method != "greedy":
+                raise ValueError("self_swa only supports greedy draft sampling.")
+            if self.rejection_sample_method != "standard":
+                raise ValueError("self_swa only supports standard rejection sampling.")
+
+        elif self.method in ("ngram", "ngram_gpu"):
             # Set default values if not provided
             if self.prompt_lookup_min is None and self.prompt_lookup_max is None:
                 # TODO(woosuk): Tune these values. They are arbitrarily chosen.
@@ -1041,6 +1061,9 @@ class SpeculativeConfig:
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"
 
+    def use_self_swa(self) -> bool:
+        return self.method == "self_swa"
+
     def uses_extract_hidden_states(self) -> bool:
         return self.method == "extract_hidden_states"
 
@@ -1051,7 +1074,7 @@ class SpeculativeConfig:
         method = self.method
         model = (
             None
-            if method in ("ngram", "suffix", "extract_hidden_states")
+            if method in ("ngram", "suffix", "extract_hidden_states", "self_swa")
             else self.draft_model_config.model
         )
         num_spec_tokens = self.num_speculative_tokens
