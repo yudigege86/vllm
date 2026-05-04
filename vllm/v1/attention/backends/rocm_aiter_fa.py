@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with AiterFlashAttention."""
 
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -37,6 +38,42 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 _SELF_SWA_FORWARD_CONTEXT_KEY = "self_swa_sliding_window"
+_SELF_SWA_DEBUG_ENV = "VLLM_SELF_SWA_DEBUG"
+
+
+def _self_swa_debug_enabled() -> bool:
+    return os.environ.get(_SELF_SWA_DEBUG_ENV, "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _tensor_debug(tensor: torch.Tensor | None, limit: int = 8):
+    if tensor is None:
+        return None
+    if tensor.is_cuda and torch.cuda.is_current_stream_capturing():
+        return {
+            "shape": tuple(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "device": str(tensor.device),
+            "capturing": True,
+        }
+    return tensor.detach().flatten()[:limit].cpu().tolist()
+
+
+def _layer_debug_name(layer: torch.nn.Module) -> str:
+    return getattr(layer, "layer_name", layer.__class__.__name__)
+
+
+def _current_forward_phase() -> tuple[str, tuple[int, int] | None]:
+    try:
+        forward_context = get_forward_context()
+    except AssertionError:
+        return "no_forward_context", None
+    window = forward_context.additional_kwargs.get(_SELF_SWA_FORWARD_CONTEXT_KEY)
+    return ("self_swa_draft" if window is not None else "target"), window
 if current_platform.is_rocm():
     from vllm.triton_utils import tl, triton
 
@@ -1109,6 +1146,34 @@ class AiterFlashAttentionImpl(AttentionImpl):
             key_cache = key_cache.view(current_platform.fp8_dtype())
             value_cache = value_cache.view(current_platform.fp8_dtype())
 
+        if _self_swa_debug_enabled():
+            phase, override_window = _current_forward_phase()
+            logger.info(
+                "aiter_fa forward: phase=%s layer=%s override_window=%s "
+                "effective_window=%s num_actual_tokens=%s num_decodes=%s "
+                "num_decode_tokens=%s num_extends=%s num_prefills=%s "
+                "max_query_len=%s max_seq_len=%s seq_lens=%s "
+                "slot_mapping=%s kv_cache_ptr=%s key_cache_ptr=%s "
+                "value_cache_ptr=%s block_table_shape=%s",
+                phase,
+                _layer_debug_name(layer),
+                override_window,
+                sliding_window,
+                attn_metadata.num_actual_tokens,
+                attn_metadata.num_decodes,
+                attn_metadata.num_decode_tokens,
+                attn_metadata.num_extends,
+                attn_metadata.num_prefills,
+                attn_metadata.max_query_len,
+                attn_metadata.max_seq_len,
+                _tensor_debug(attn_metadata.seq_lens),
+                _tensor_debug(attn_metadata.slot_mapping),
+                kv_cache.data_ptr(),
+                key_cache.data_ptr(),
+                value_cache.data_ptr(),
+                tuple(attn_metadata.block_table.shape),
+            )
+
         # decode:extend:prefill
         query = query[:num_actual_tokens]
         if key is not None:
@@ -1437,6 +1502,22 @@ class AiterFlashAttentionImpl(AttentionImpl):
         if is_quantized_kv_cache(self.kv_cache_dtype):
             key_cache = key_cache.view(current_platform.fp8_dtype())
             value_cache = value_cache.view(current_platform.fp8_dtype())
+        if _self_swa_debug_enabled():
+            phase, override_window = _current_forward_phase()
+            logger.info(
+                "aiter_fa kv_update: phase=%s layer=%s override_window=%s "
+                "key_shape=%s value_shape=%s slot_mapping=%s kv_cache_ptr=%s "
+                "key_cache_ptr=%s value_cache_ptr=%s",
+                phase,
+                _layer_debug_name(layer),
+                override_window,
+                tuple(key.shape) if key is not None else None,
+                tuple(value.shape) if value is not None else None,
+                _tensor_debug(slot_mapping),
+                kv_cache.data_ptr(),
+                key_cache.data_ptr(),
+                value_cache.data_ptr(),
+            )
         # Reshape the input keys and values and store them in the cache.
         # Skip this if sharing KV cache with an earlier attention layer.
         # NOTE(woosuk): Here, key and value are padded while slot_mapping

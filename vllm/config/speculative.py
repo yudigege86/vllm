@@ -145,6 +145,9 @@ class SpeculativeConfig:
     provided. Defaults to 1."""
 
     # Alternative drafting strategies
+    self_swa_window_size: int = Field(default=4096, gt=0)
+    """Sliding-window size used by the experimental self-SWA drafter."""
+
     speculative_token_tree: str | None = None
     """Specifies the tree structure for speculative token generation.
     """
@@ -560,6 +563,10 @@ class SpeculativeConfig:
             self.prompt_lookup_min = 0
             self.draft_model_config = self.target_model_config
             self.draft_parallel_config = self.target_parallel_config
+            if self.speculative_token_tree is None:
+                self.speculative_token_tree = str(
+                    [(i + 1) * (0,) for i in range(self.num_speculative_tokens)]
+                )
             if self.draft_sample_method != "greedy":
                 raise ValueError("self_swa only supports greedy draft sampling.")
             if self.rejection_sample_method != "standard":

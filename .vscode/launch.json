@@ -1,0 +1,83 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug self-SWA GLM 1M",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/examples/features/speculative_decoding/self_swa_offline.py",
+      "python": "/usr/bin/python",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "subProcess": true,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "PYTHONPYCACHEPREFIX": "/tmp/vllm-pycache",
+        "HF_HOME": "/root/.cache/huggingface",
+        "HF_HUB_OFFLINE": "0",
+        "TRANSFORMERS_OFFLINE": "0",
+        "VLLM_CACHE_ROOT": "/tmp/vllm-cache",
+        "VLLM_ROCM_USE_AITER": "1",
+        "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": "False"
+      },
+      "args": [
+        "--model",
+        "zai-org/glm-4-9b-chat-1m",
+        "--prompt-len",
+        "8192",
+        "--self-swa-window-size",
+        "4096",
+        "--output-len",
+        "128",
+        "--num-spec-tokens",
+        "4",
+        "--max-model-len",
+        "16384",
+        "--max-num-seqs",
+        "1",
+        "--max-num-batched-tokens",
+        "16384"
+      ]
+    },
+    {
+      "name": "Debug self-SWA Qwen 0.5B smoke",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/examples/features/speculative_decoding/self_swa_offline.py",
+      "python": "/usr/bin/python",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "subProcess": true,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "PYTHONPYCACHEPREFIX": "/tmp/vllm-pycache",
+        "HF_HOME": "/root/.cache/huggingface",
+        "HF_HUB_OFFLINE": "0",
+        "TRANSFORMERS_OFFLINE": "0",
+        "VLLM_CACHE_ROOT": "/tmp/vllm-cache",
+        "VLLM_ROCM_USE_AITER": "1",
+        "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": "False"
+      },
+      "args": [
+        "--model",
+        "Qwen/Qwen2.5-0.5B-Instruct",
+        "--prompt-len",
+        "4097",
+        "--self-swa-window-size",
+        "4096",
+        "--output-len",
+        "4",
+        "--num-spec-tokens",
+        "2",
+        "--max-model-len",
+        "6144",
+        "--max-num-seqs",
+        "1",
+        "--max-num-batched-tokens",
+        "6144"
+      ]
+    }
+  ]
+}
