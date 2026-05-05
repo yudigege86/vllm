@@ -38,6 +38,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 _SELF_SWA_FORWARD_CONTEXT_KEY = "self_swa_sliding_window"
+_SELF_SWA_SINK_SIZE_FORWARD_CONTEXT_KEY = "self_swa_sink_size"
 _SELF_SWA_DEBUG_ENV = "VLLM_SELF_SWA_DEBUG"
 
 
@@ -67,13 +68,22 @@ def _layer_debug_name(layer: torch.nn.Module) -> str:
     return getattr(layer, "layer_name", layer.__class__.__name__)
 
 
-def _current_forward_phase() -> tuple[str, tuple[int, int] | None]:
+def _current_forward_phase() -> tuple[str, tuple[int, int] | None, int]:
     try:
         forward_context = get_forward_context()
     except AssertionError:
-        return "no_forward_context", None
+        return "no_forward_context", None, 0
     window = forward_context.additional_kwargs.get(_SELF_SWA_FORWARD_CONTEXT_KEY)
-    return ("self_swa_draft" if window is not None else "target"), window
+    sink_size = 0
+    if window is not None:
+        sink_size = int(
+            forward_context.additional_kwargs.get(
+                _SELF_SWA_SINK_SIZE_FORWARD_CONTEXT_KEY, 0
+            )
+        )
+    return ("self_swa_draft" if window is not None else "target"), window, sink_size
+
+
 if current_platform.is_rocm():
     from vllm.triton_utils import tl, triton
 
@@ -908,6 +918,150 @@ class AiterFlashAttentionImpl(AttentionImpl):
             _SELF_SWA_FORWARD_CONTEXT_KEY, self.sliding_window
         )
 
+    def _get_self_swa_sink_size(self) -> int:
+        try:
+            forward_context = get_forward_context()
+        except AssertionError:
+            return 0
+        if _SELF_SWA_FORWARD_CONTEXT_KEY not in forward_context.additional_kwargs:
+            return 0
+        return int(
+            forward_context.additional_kwargs.get(
+                _SELF_SWA_SINK_SIZE_FORWARD_CONTEXT_KEY, 0
+            )
+        )
+
+    def _self_swa_sink_decode_forward(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: AiterFlashAttentionMetadata,
+        num_decodes: int,
+        num_decode_tokens: int,
+        sink_size: int,
+        recent_window: int,
+    ) -> None:
+        if self.alibi_slopes is not None:
+            raise NotImplementedError(
+                "self_swa attention sinks do not currently support ALiBi models."
+            )
+        if rocm_aiter_ops.is_shuffle_kv_cache_enabled():
+            raise NotImplementedError(
+                "self_swa attention sinks require "
+                "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=False."
+            )
+        if recent_window <= 0:
+            raise ValueError(
+                f"self_swa recent window must be positive, got {recent_window}."
+            )
+
+        assert attn_metadata.decode_metadata is not None
+        assert attn_metadata.decode_metadata.max_query_len == 1
+        assert num_decode_tokens == num_decodes
+
+        seq_lens = attn_metadata.seq_lens[:num_decodes]
+        sink_limit = torch.full_like(seq_lens, sink_size)
+        sink_lengths = torch.minimum(seq_lens, sink_limit)
+        recent_starts = torch.maximum(
+            sink_lengths, seq_lens - torch.full_like(seq_lens, recent_window)
+        )
+        recent_lengths = seq_lens - recent_starts
+        visible_seq_lens = sink_lengths + recent_lengths
+        total_visible_tokens = int(visible_seq_lens.sum().item())
+        max_visible_seq_len = int(visible_seq_lens.max().item())
+
+        segment_lengths = torch.stack((sink_lengths, recent_lengths), dim=1).reshape(-1)
+        segment_starts = torch.stack(
+            (torch.zeros_like(sink_lengths), recent_starts), dim=1
+        ).reshape(-1)
+        segment_cu_seqlens = torch.cat(
+            (
+                torch.zeros(1, dtype=torch.int32, device=query.device),
+                torch.cumsum(segment_lengths, dim=0, dtype=torch.int32),
+            )
+        )
+        visible_cu_seqlens = torch.cat(
+            (
+                torch.zeros(1, dtype=torch.int32, device=query.device),
+                torch.cumsum(visible_seq_lens, dim=0, dtype=torch.int32),
+            )
+        )
+        token_to_segment = torch.repeat_interleave(
+            torch.arange(
+                segment_lengths.numel(), dtype=torch.int32, device=query.device
+            ),
+            segment_lengths.to(torch.int64),
+        )
+        expanded_block_table = torch.repeat_interleave(
+            attn_metadata.block_table[:num_decodes], repeats=2, dim=0
+        )
+
+        gathered_key = torch.empty(
+            (total_visible_tokens, self.num_kv_heads, key_cache.shape[-1]),
+            dtype=key_cache.dtype,
+            device=query.device,
+        )
+        gathered_value = torch.empty(
+            (total_visible_tokens, self.num_kv_heads, value_cache.shape[-1]),
+            dtype=value_cache.dtype,
+            device=query.device,
+        )
+
+        if _self_swa_debug_enabled():
+            logger.info(
+                "aiter_fa self_swa sink decode: layer=%s sink_size=%s "
+                "recent_window=%s seq_lens=%s sink_lengths=%s "
+                "recent_starts=%s recent_lengths=%s visible_seq_lens=%s "
+                "total_visible_tokens=%s max_visible_seq_len=%s",
+                _layer_debug_name(layer),
+                sink_size,
+                recent_window,
+                _tensor_debug(seq_lens),
+                _tensor_debug(sink_lengths),
+                _tensor_debug(recent_starts),
+                _tensor_debug(recent_lengths),
+                _tensor_debug(visible_seq_lens),
+                total_visible_tokens,
+                max_visible_seq_len,
+            )
+
+        cp_mha_gather_cache(
+            key_cache=key_cache,
+            value_cache=value_cache,
+            key=gathered_key,
+            value=gathered_value,
+            block_tables=expanded_block_table,
+            k_scales=layer._k_scale,
+            v_scales=layer._v_scale,
+            cu_seqlens_kv=segment_cu_seqlens,
+            token_to_batch=token_to_segment,
+            seq_starts=segment_starts,
+            dequant=is_quantized_kv_cache(self.kv_cache_dtype),
+            kv_cache_layout="NHD",
+            total_tokens=total_visible_tokens,
+        )
+
+        rocm_aiter_ops.flash_attn_varlen_func(
+            q=query[:num_decode_tokens],
+            k=gathered_key,
+            v=gathered_value,
+            cu_seqlens_q=attn_metadata.query_start_loc[: num_decodes + 1],
+            cu_seqlens_k=visible_cu_seqlens,
+            max_seqlen_q=1,
+            max_seqlen_k=max_visible_seq_len,
+            min_seqlen_q=1,
+            dropout_p=0.0,
+            softmax_scale=self.scale,
+            causal=True,
+            window_size=(-1, -1),
+            alibi_slopes=None,
+            return_lse=False,
+            out=output[:num_decode_tokens],
+        )
+
     def extend_for_sliding_window(
         self,
         attn_metadata: AiterFlashAttentionMetadata,
@@ -1140,6 +1294,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
         # performance to make sure it does not introduce any overhead.
         num_actual_tokens = attn_metadata.num_actual_tokens
         sliding_window = self._get_effective_sliding_window()
+        self_swa_sink_size = self._get_self_swa_sink_size()
         key_cache, value_cache = kv_cache.unbind(0)
 
         if is_quantized_kv_cache(self.kv_cache_dtype):
@@ -1147,17 +1302,19 @@ class AiterFlashAttentionImpl(AttentionImpl):
             value_cache = value_cache.view(current_platform.fp8_dtype())
 
         if _self_swa_debug_enabled():
-            phase, override_window = _current_forward_phase()
+            phase, override_window, sink_size = _current_forward_phase()
             logger.info(
                 "aiter_fa forward: phase=%s layer=%s override_window=%s "
-                "effective_window=%s num_actual_tokens=%s num_decodes=%s "
-                "num_decode_tokens=%s num_extends=%s num_prefills=%s "
+                "sink_size=%s effective_window=%s num_actual_tokens=%s "
+                "num_decodes=%s num_decode_tokens=%s num_extends=%s "
+                "num_prefills=%s "
                 "max_query_len=%s max_seq_len=%s seq_lens=%s "
                 "slot_mapping=%s kv_cache_ptr=%s key_cache_ptr=%s "
                 "value_cache_ptr=%s block_table_shape=%s",
                 phase,
                 _layer_debug_name(layer),
                 override_window,
+                sink_size,
                 sliding_window,
                 attn_metadata.num_actual_tokens,
                 attn_metadata.num_decodes,
@@ -1257,6 +1414,21 @@ class AiterFlashAttentionImpl(AttentionImpl):
             if num_decodes > 0:
                 assert attn_metadata.decode_metadata is not None
                 decode_max_query_len = attn_metadata.decode_metadata.max_query_len
+
+                if self_swa_sink_size > 0:
+                    self._self_swa_sink_decode_forward(
+                        layer=layer,
+                        query=query,
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        output=output,
+                        attn_metadata=attn_metadata,
+                        num_decodes=num_decodes,
+                        num_decode_tokens=num_decode_tokens,
+                        sink_size=self_swa_sink_size,
+                        recent_window=sliding_window[0] + 1,
+                    )
+                    return
 
                 # Multi-token speculative decode path.
                 if decode_max_query_len > 1:
@@ -1503,14 +1675,16 @@ class AiterFlashAttentionImpl(AttentionImpl):
             key_cache = key_cache.view(current_platform.fp8_dtype())
             value_cache = value_cache.view(current_platform.fp8_dtype())
         if _self_swa_debug_enabled():
-            phase, override_window = _current_forward_phase()
+            phase, override_window, sink_size = _current_forward_phase()
             logger.info(
                 "aiter_fa kv_update: phase=%s layer=%s override_window=%s "
-                "key_shape=%s value_shape=%s slot_mapping=%s kv_cache_ptr=%s "
+                "sink_size=%s key_shape=%s value_shape=%s slot_mapping=%s "
+                "kv_cache_ptr=%s "
                 "key_cache_ptr=%s value_cache_ptr=%s",
                 phase,
                 _layer_debug_name(layer),
                 override_window,
+                sink_size,
                 tuple(key.shape) if key is not None else None,
                 tuple(value.shape) if value is not None else None,
                 _tensor_debug(slot_mapping),

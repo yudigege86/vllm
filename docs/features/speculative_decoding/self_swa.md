@@ -1,10 +1,11 @@
 # Self-SWA Speculative Decoding
 
 Self-SWA speculative decoding is an experimental greedy-only method that uses
-the target model itself as the drafter. The draft pass temporarily applies a
-fixed sliding-window attention mask during decode, writes provisional KV into
-the target request's lookahead slots, and lets the normal full-attention target
-pass verify the draft tokens.
+the target model itself as the drafter. The draft pass temporarily keeps the
+initial attention-sink tokens plus a fixed recent sliding-window during decode,
+writes provisional KV into the target request's lookahead slots, and lets the
+normal full-attention target pass verify the draft tokens. Set
+`self_swa_sink_size` to `0` to recover pure sliding-window drafting.
 
 This method is intended for standard decoder-only, full-attention models with
 very long contexts, where the sliding-window draft can be cheaper than full
@@ -35,6 +36,7 @@ self_swa = LLM(
     speculative_config={
         "method": "self_swa",
         "num_speculative_tokens": 4,
+        "self_swa_sink_size": 4,
     },
 )
 
@@ -48,3 +50,6 @@ assert baseline_outputs[0].outputs[0].token_ids == (
 
 After exactness is confirmed, sweep `num_speculative_tokens` values such as
 `2`, `4`, and `8`, and record acceptance length, tokens/sec, and draft overhead.
+You can also compare `self_swa_sink_size=4` against `0`; the former follows the
+StreamingLLM-style pattern of keeping initial sink tokens plus recent tokens,
+without extending the model's long-term memory.

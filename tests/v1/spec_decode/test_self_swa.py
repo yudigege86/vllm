@@ -7,7 +7,10 @@ import pytest
 
 from vllm.config import ParallelConfig, SpeculativeConfig, VllmConfig
 from vllm.forward_context import get_forward_context, set_forward_context
-from vllm.v1.spec_decode.self_swa import SELF_SWA_FORWARD_CONTEXT_KEY
+from vllm.v1.spec_decode.self_swa import (
+    SELF_SWA_FORWARD_CONTEXT_KEY,
+    SELF_SWA_SINK_SIZE_FORWARD_CONTEXT_KEY,
+)
 
 
 class _FakeModelConfig:
@@ -35,6 +38,30 @@ def test_self_swa_speculative_config_reuses_target_model_config():
     assert speculative_config.use_self_swa()
     assert speculative_config.draft_model_config is target_model_config
     assert speculative_config.draft_parallel_config is target_parallel_config
+    assert speculative_config.self_swa_sink_size == 4
+
+
+def test_self_swa_sink_size_can_disable_attention_sink():
+    speculative_config = SpeculativeConfig(
+        method="self_swa",
+        num_speculative_tokens=4,
+        self_swa_sink_size=0,
+        target_model_config=_FakeModelConfig(),
+        target_parallel_config=ParallelConfig(),
+    )
+
+    assert speculative_config.self_swa_sink_size == 0
+
+
+def test_self_swa_rejects_negative_sink_size():
+    with pytest.raises(ValueError):
+        SpeculativeConfig(
+            method="self_swa",
+            num_speculative_tokens=4,
+            self_swa_sink_size=-1,
+            target_model_config=_FakeModelConfig(),
+            target_parallel_config=ParallelConfig(),
+        )
 
 
 def test_self_swa_rejects_non_greedy_draft_sampling():
@@ -50,19 +77,21 @@ def test_self_swa_rejects_non_greedy_draft_sampling():
 
 def test_self_swa_forward_context_override_is_scoped():
     window = (4095, 0)
+    sink_size = 4
 
     with set_forward_context(
         attn_metadata={},
         vllm_config=VllmConfig(),
-        additional_kwargs={SELF_SWA_FORWARD_CONTEXT_KEY: window},
+        additional_kwargs={
+            SELF_SWA_FORWARD_CONTEXT_KEY: window,
+            SELF_SWA_SINK_SIZE_FORWARD_CONTEXT_KEY: sink_size,
+        },
     ):
-        assert (
-            get_forward_context().additional_kwargs[SELF_SWA_FORWARD_CONTEXT_KEY]
-            == window
-        )
+        additional_kwargs = get_forward_context().additional_kwargs
+        assert additional_kwargs[SELF_SWA_FORWARD_CONTEXT_KEY] == window
+        assert additional_kwargs[SELF_SWA_SINK_SIZE_FORWARD_CONTEXT_KEY] == sink_size
 
     with set_forward_context(attn_metadata={}, vllm_config=VllmConfig()):
-        assert (
-            SELF_SWA_FORWARD_CONTEXT_KEY
-            not in get_forward_context().additional_kwargs
-        )
+        additional_kwargs = get_forward_context().additional_kwargs
+        assert SELF_SWA_FORWARD_CONTEXT_KEY not in additional_kwargs
+        assert SELF_SWA_SINK_SIZE_FORWARD_CONTEXT_KEY not in additional_kwargs

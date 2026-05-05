@@ -147,6 +147,11 @@ class SpeculativeConfig:
     # Alternative drafting strategies
     self_swa_window_size: int = Field(default=4096, gt=0)
     """Sliding-window size used by the experimental self-SWA drafter."""
+    self_swa_sink_size: int = Field(default=4, ge=0)
+    """Number of initial attention-sink tokens kept by the self-SWA drafter.
+
+    Set to 0 to use pure sliding-window attention.
+    """
 
     speculative_token_tree: str | None = None
     """Specifies the tree structure for speculative token generation.

@@ -20,6 +20,7 @@ from vllm.v1.spec_decode.utils import eagle_step_update_slot_mapping_and_metadat
 # Experimental knobs for the first self-SWA prototype.
 SELF_SWA_WINDOW_SIZE = 4096
 SELF_SWA_FORWARD_CONTEXT_KEY = "self_swa_sliding_window"
+SELF_SWA_SINK_SIZE_FORWARD_CONTEXT_KEY = "self_swa_sink_size"
 SELF_SWA_DEBUG_ENV = "VLLM_SELF_SWA_DEBUG"
 
 logger = init_logger(__name__)
@@ -78,12 +79,18 @@ class SelfSWAProposer(SpecDecodeBaseProposer):
             raise NotImplementedError("self_swa currently supports text-only models.")
 
         self.self_swa_window_size = self.speculative_config.self_swa_window_size
+        self.self_swa_sink_size = self.speculative_config.self_swa_sink_size
         self._self_swa_window = (self.self_swa_window_size - 1, 0)
+        self._self_swa_visible_size = (
+            self.self_swa_window_size + self.self_swa_sink_size
+        )
         if _debug_enabled():
             logger.info(
-                "self_swa init: window=%s num_speculative_tokens=%s "
-                "max_model_len=%s",
+                "self_swa init: window=%s sink_size=%s visible_size=%s "
+                "num_speculative_tokens=%s max_model_len=%s",
                 self._self_swa_window,
+                self.self_swa_sink_size,
+                self._self_swa_visible_size,
                 self.num_speculative_tokens,
                 self.max_model_len,
             )
@@ -178,16 +185,19 @@ class SelfSWAProposer(SpecDecodeBaseProposer):
             )
 
         if (
-            common_attn_metadata.max_seq_len <= self.self_swa_window_size
+            common_attn_metadata.max_seq_len <= self._self_swa_visible_size
             or common_attn_metadata.max_seq_len + self.num_speculative_tokens
             > self.max_model_len
         ):
             if _debug_enabled():
                 logger.info(
                     "self_swa propose skip: max_seq_len=%s window_size=%s "
-                    "num_speculative_tokens=%s max_model_len=%s",
+                    "sink_size=%s visible_size=%s num_speculative_tokens=%s "
+                    "max_model_len=%s",
                     common_attn_metadata.max_seq_len,
                     self.self_swa_window_size,
+                    self.self_swa_sink_size,
+                    self._self_swa_visible_size,
                     self.num_speculative_tokens,
                     self.max_model_len,
                 )
@@ -319,11 +329,12 @@ class SelfSWAProposer(SpecDecodeBaseProposer):
             if _debug_enabled():
                 logger.info(
                     "self_swa draft model input: draft_index=%s input_ids=%s "
-                    "positions=%s window=%s slot_mapping_layers=%s",
+                    "positions=%s window=%s sink_size=%s slot_mapping_layers=%s",
                     draft_index,
                     _tensor_debug(self.input_ids[:batch_size]),
                     _tensor_debug(positions),
                     self._self_swa_window,
+                    self.self_swa_sink_size,
                     len(slot_mapping),
                 )
             with set_forward_context(
@@ -334,6 +345,9 @@ class SelfSWAProposer(SpecDecodeBaseProposer):
                 slot_mapping=slot_mapping,
                 additional_kwargs={
                     SELF_SWA_FORWARD_CONTEXT_KEY: self._self_swa_window,
+                    SELF_SWA_SINK_SIZE_FORWARD_CONTEXT_KEY: (
+                        self.self_swa_sink_size
+                    ),
                 },
             ):
                 ret_hidden_states = self.model(**model_kwargs)
