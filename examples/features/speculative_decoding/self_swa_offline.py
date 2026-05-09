@@ -5,12 +5,14 @@
 This script creates max-context engines for the sweep: one greedy baseline
 engine, then one greedy self-SWA engine per sliding-window size. Each engine runs
 the requested prompt lengths, comparing generated token IDs and printing speed
-and per-case self-SWA acceptance metrics. It is intended for ROCm AITER with
-shuffled KV cache disabled.
+and per-case self-SWA acceptance metrics. The self-SWA path currently requires
+the ROCm AITER attention backend; baseline-only runs can use other backends.
 """
 
 import gc
+import json
 import os
+import re
 import time
 from argparse import BooleanOptionalAction, Namespace
 from contextlib import suppress
@@ -21,7 +23,6 @@ from typing import Any
 # These environment variables must be set before importing vLLM.
 os.environ.setdefault("VLLM_CACHE_ROOT", "/tmp/vllm-cache")
 os.environ.setdefault("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
-os.environ.setdefault("VLLM_ROCM_USE_AITER", "1")
 os.environ.setdefault("VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", "False")
 
 import torch
@@ -75,6 +76,7 @@ class SweepResult:
     prompt_len: int
     actual_prompt_lens: list[int]
     max_model_len: int
+    num_spec_tokens: int
     self_swa_window_size: int
     exact_match: bool
     baseline_decode_tokens_per_s: float
@@ -94,9 +96,19 @@ def _env_is_true(value: str) -> bool:
     return value.lower() in ("1", "true", "yes", "on")
 
 
-def validate_env() -> None:
-    if not _env_is_true(os.environ["VLLM_ROCM_USE_AITER"]):
-        raise RuntimeError("self-SWA validation requires VLLM_ROCM_USE_AITER=1.")
+def validate_env(args: Namespace) -> None:
+    uses_aiter_fa = args.attention_backend == "ROCM_AITER_FA"
+    baseline_only = getattr(args, "baseline_only", False)
+    if uses_aiter_fa and not _env_is_true(os.environ.get("VLLM_ROCM_USE_AITER", "0")):
+        raise RuntimeError(
+            "ROCM_AITER_FA requires VLLM_ROCM_USE_AITER=1. Use "
+            "--attention-backend ROCM_ATTN for a non-AITER baseline run."
+        )
+    if not baseline_only and not uses_aiter_fa:
+        raise RuntimeError(
+            "self-SWA currently requires --attention-backend ROCM_AITER_FA. "
+            "Use --baseline-only when testing a non-AITER backend."
+        )
     if _env_is_true(os.environ["VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT"]):
         raise RuntimeError(
             "self-SWA validation requires "
@@ -175,6 +187,14 @@ def parse_args() -> Namespace:
     parser.add_argument("--output-len", type=int, default=128)
     parser.add_argument("--num-prompts", type=int, default=1)
     parser.add_argument("--num-spec-tokens", type=int, default=4)
+    parser.add_argument(
+        "--num-spec-tokens-list",
+        default=None,
+        help=(
+            "Optional comma-separated num_spec_tokens values to sweep while "
+            "reusing the same baseline, e.g. 4,8,16,32,64."
+        ),
+    )
     parser.add_argument("--tp", type=int, default=DEFAULT_TENSOR_PARALLEL_SIZE)
     parser.add_argument(
         "--max-model-len",
@@ -189,13 +209,34 @@ def parse_args() -> Namespace:
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--attention-backend", default="ROCM_AITER_FA")
     parser.add_argument(
+        "--hf-overrides",
+        type=json.loads,
+        default={},
+        help="JSON or dotted Hugging Face config overrides passed to LLM.",
+    )
+    parser.add_argument(
         "--trust-remote-code", action=BooleanOptionalAction, default=True
     )
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--disable-chunked-prefill", action="store_true")
     parser.add_argument("--max-num-batched-tokens", type=int, default=None)
     parser.add_argument("--max-num-seqs", type=int, default=None)
+    parser.add_argument(
+        "--profile-dir",
+        default=None,
+        help="Directory for torch profiler traces. Profiles each generate() call.",
+    )
+    parser.add_argument("--profile-delay-iterations", type=int, default=0)
+    parser.add_argument("--profile-max-iterations", type=int, default=0)
+    parser.add_argument(
+        "--profile-with-stack", action=BooleanOptionalAction, default=False
+    )
     parser.add_argument("--continue-on-error", action="store_true")
+    parser.add_argument(
+        "--baseline-only",
+        action="store_true",
+        help="Run only the greedy baseline, useful for backend crash isolation.",
+    )
     parser.add_argument("--print-output", action="store_true")
     return parser.parse_args()
 
@@ -216,6 +257,14 @@ def resolve_window_sizes(args: Namespace) -> list[int]:
     return _parse_int_list(args.self_swa_window_sizes, "--self-swa-window-sizes")
 
 
+def resolve_num_spec_tokens(args: Namespace) -> list[int]:
+    if args.num_spec_tokens_list is None:
+        if args.num_spec_tokens <= 0:
+            raise ValueError("--num-spec-tokens must be positive")
+        return [args.num_spec_tokens]
+    return _parse_int_list(args.num_spec_tokens_list, "--num-spec-tokens-list")
+
+
 def check_window_eligible(
     prompt_len: int, window_size: int, self_swa_sink_size: int
 ) -> tuple[bool, str | None]:
@@ -230,10 +279,13 @@ def auto_max_model_len(args: Namespace, prompt_len: int) -> int:
     return prompt_len + args.output_len + args.num_spec_tokens + 1
 
 
-def make_sweep_args(args: Namespace, prompt_lens: list[int]) -> Namespace:
+def make_sweep_args(
+    args: Namespace, prompt_lens: list[int], num_spec_tokens_values: list[int]
+) -> Namespace:
     sweep_args = copy(args)
+    sweep_args.num_spec_tokens = max(num_spec_tokens_values)
     sweep_args.max_model_len = args.max_model_len or max(
-        auto_max_model_len(args, prompt_len) for prompt_len in prompt_lens
+        auto_max_model_len(sweep_args, prompt_len) for prompt_len in prompt_lens
     )
     return sweep_args
 
@@ -310,6 +362,22 @@ def make_llm_kwargs(args: Namespace, speculative_config: dict[str, Any] | None) 
         "attention_backend": args.attention_backend,
         "disable_log_stats": False,
     }
+    if args.hf_overrides:
+        kwargs["hf_overrides"] = args.hf_overrides
+    if args.profile_dir is not None:
+        kwargs["profiler_config"] = {
+            "profiler": "torch",
+            "torch_profiler_dir": args.profile_dir,
+            "torch_profiler_with_stack": args.profile_with_stack,
+            "torch_profiler_with_memory": False,
+            "torch_profiler_record_shapes": False,
+            "torch_profiler_with_flops": False,
+            "torch_profiler_use_gzip": True,
+            "torch_profiler_dump_cuda_time_total": True,
+            "ignore_frontend": True,
+            "delay_iterations": args.profile_delay_iterations,
+            "max_iterations": args.profile_max_iterations,
+        }
     if speculative_config is not None:
         kwargs["speculative_config"] = speculative_config
     if args.max_num_batched_tokens is not None:
@@ -361,6 +429,10 @@ def create_llm(
     return LLM(**make_llm_kwargs(args, speculative_config))
 
 
+def _profile_prefix(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_") or "profile"
+
+
 def run_generation(
     name: str,
     llm: LLM,
@@ -373,7 +445,18 @@ def run_generation(
         max_tokens=args.output_len,
     )
     start = time.perf_counter()
-    outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
+    if args.profile_dir is not None:
+        print(
+            f"Starting torch profiler: dir={args.profile_dir} "
+            f"prefix={_profile_prefix(name)}"
+        )
+        llm.start_profile(profile_prefix=_profile_prefix(name))
+    try:
+        outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
+    finally:
+        if args.profile_dir is not None:
+            llm.stop_profile()
+            print(f"Stopped torch profiler: dir={args.profile_dir}")
     elapsed_s = time.perf_counter() - start
     metrics = llm.get_metrics()
     token_ids = [list(output.outputs[0].token_ids) for output in outputs]
@@ -625,6 +708,7 @@ def run_window_sweep(
                         prompt_len=case.prompt_len,
                         actual_prompt_lens=case.actual_prompt_lens,
                         max_model_len=args.max_model_len,
+                        num_spec_tokens=args.num_spec_tokens,
                         self_swa_window_size=window_size,
                         exact_match=exact_match,
                         baseline_decode_tokens_per_s=baseline.decode_tokens_per_s,
@@ -654,25 +738,32 @@ def run_sweep(
     tokenizer: AutoTokenizer,
     prompt_lens: list[int],
     window_sizes: list[int],
+    num_spec_tokens_values: list[int],
 ) -> list[SweepResult]:
-    sweep_args = make_sweep_args(args, prompt_lens)
+    sweep_args = make_sweep_args(args, prompt_lens, num_spec_tokens_values)
     print(f"max_model_len: {sweep_args.max_model_len}")
     prompt_cases = build_prompt_cases(sweep_args, tokenizer, prompt_lens)
     baseline_results = run_baseline_sweep(sweep_args, prompt_cases)
+    if args.baseline_only:
+        return []
 
     results = []
-    for window_size in window_sizes:
-        print("\n" + "#" * 80)
-        print(f"self_swa_window_size: {window_size}")
-        print("#" * 80)
-        results.extend(
-            run_window_sweep(
-                sweep_args,
-                prompt_cases,
-                baseline_results,
-                window_size,
+    for num_spec_tokens in num_spec_tokens_values:
+        spec_args = copy(sweep_args)
+        spec_args.num_spec_tokens = num_spec_tokens
+        for window_size in window_sizes:
+            print("\n" + "#" * 80)
+            print(f"num_spec_tokens: {num_spec_tokens}")
+            print(f"self_swa_window_size: {window_size}")
+            print("#" * 80)
+            results.extend(
+                run_window_sweep(
+                    spec_args,
+                    prompt_cases,
+                    baseline_results,
+                    window_size,
+                )
             )
-        )
     return results
 
 
@@ -683,14 +774,15 @@ def print_sweep_summary(results: list[SweepResult]) -> None:
 
     print("\n=== sweep summary ===")
     print(
-        "prompt_len\tmax_model_len\twindow_size\texact_match\t"
-        "baseline_decode_tps\tself_swa_decode_tps\tspeedup\t"
-        "num_drafts\tmean_acceptance_length"
+        "prompt_len\tmax_model_len\tnum_spec_tokens\twindow_size\t"
+        "exact_match\tbaseline_decode_tps\tself_swa_decode_tps\t"
+        "speedup\tnum_drafts\tmean_acceptance_length"
     )
     for result in results:
         print(
             f"{result.prompt_len}\t"
             f"{result.max_model_len}\t"
+            f"{result.num_spec_tokens}\t"
             f"{result.self_swa_window_size}\t"
             f"{result.exact_match}\t"
             f"{result.baseline_decode_tokens_per_s:.2f}\t"
@@ -703,21 +795,28 @@ def print_sweep_summary(results: list[SweepResult]) -> None:
 
 def main() -> None:
     args = parse_args()
-    validate_env()
+    validate_env(args)
     prompt_lens = resolve_prompt_lens(args)
     window_sizes = resolve_window_sizes(args)
+    num_spec_tokens_values = resolve_num_spec_tokens(args)
     print(f"model: {args.model}")
     print(f"prompt_lens: {prompt_lens}")
     print(f"self_swa_window_sizes: {window_sizes}")
     print(f"tensor_parallel_size: {args.tp}")
     print(f"output_len: {args.output_len}")
     print(f"num_prompts: {args.num_prompts}")
-    print(f"num_spec_tokens: {args.num_spec_tokens}")
+    print(f"num_spec_tokens: {num_spec_tokens_values}")
+    print(f"baseline_only: {args.baseline_only}")
+    print(f"profile_dir: {args.profile_dir}")
+    print(f"hf_overrides: {args.hf_overrides}")
     print(
         "VLLM_ALLOW_LONG_MAX_MODEL_LEN="
         f"{os.environ['VLLM_ALLOW_LONG_MAX_MODEL_LEN']}"
     )
-    print(f"VLLM_ROCM_USE_AITER={os.environ['VLLM_ROCM_USE_AITER']}")
+    print(
+        "VLLM_ROCM_USE_AITER="
+        f"{os.environ.get('VLLM_ROCM_USE_AITER', '<unset>')}"
+    )
     print(
         "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT="
         f"{os.environ['VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT']}"
@@ -728,7 +827,9 @@ def main() -> None:
         trust_remote_code=args.trust_remote_code,
     )
 
-    results = run_sweep(args, tokenizer, prompt_lens, window_sizes)
+    results = run_sweep(
+        args, tokenizer, prompt_lens, window_sizes, num_spec_tokens_values
+    )
     print_sweep_summary(results)
 
 
