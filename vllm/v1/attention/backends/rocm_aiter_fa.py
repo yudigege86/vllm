@@ -40,10 +40,24 @@ _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 _SELF_SWA_FORWARD_CONTEXT_KEY = "self_swa_sliding_window"
 _SELF_SWA_SINK_SIZE_FORWARD_CONTEXT_KEY = "self_swa_sink_size"
 _SELF_SWA_DEBUG_ENV = "VLLM_SELF_SWA_DEBUG"
+_SELF_SWA_BLOCK_ALIGNED_PAGED_ATTN_ENV = (
+    "VLLM_SELF_SWA_BLOCK_ALIGNED_PAGED_ATTN"
+)
 
 
 def _self_swa_debug_enabled() -> bool:
     return os.environ.get(_SELF_SWA_DEBUG_ENV, "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _self_swa_block_aligned_paged_attn_enabled() -> bool:
+    return os.environ.get(
+        _SELF_SWA_BLOCK_ALIGNED_PAGED_ATTN_ENV, "0"
+    ).lower() in (
         "1",
         "true",
         "yes",
@@ -82,6 +96,75 @@ def _current_forward_phase() -> tuple[str, tuple[int, int] | None, int]:
             )
         )
     return ("self_swa_draft" if window is not None else "target"), window, sink_size
+
+
+def _make_self_swa_block_aligned_metadata(
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    sink_size: int,
+    recent_window: int,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Build block-table metadata for block-aligned sink+recent attention.
+
+    Paged attention can cheaply concatenate whole KV blocks, but cannot skip
+    individual tokens inside a block. This rounds the sink and recent regions
+    outward to block boundaries while preserving the true tail length in
+    `visible_seq_lens`.
+    """
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}.")
+    if sink_size < 0:
+        raise ValueError(f"sink_size must be non-negative, got {sink_size}.")
+    if recent_window <= 0:
+        raise ValueError(
+            f"recent_window must be positive, got {recent_window}."
+        )
+
+    sink_block_limit = cdiv(sink_size, block_size)
+    seq_blocks = torch.div(
+        seq_lens + block_size - 1, block_size, rounding_mode="floor"
+    )
+    sink_blocks = torch.minimum(
+        seq_blocks,
+        torch.full_like(seq_blocks, sink_block_limit),
+    )
+
+    recent_start_tokens = torch.clamp(seq_lens - recent_window, min=0)
+    recent_start_blocks = torch.div(
+        recent_start_tokens, block_size, rounding_mode="floor"
+    )
+    recent_start_blocks = torch.maximum(recent_start_blocks, sink_blocks)
+    recent_blocks = seq_blocks - recent_start_blocks
+    visible_blocks = sink_blocks + recent_blocks
+
+    max_visible_blocks = int(visible_blocks.max().item())
+    block_offsets = torch.arange(
+        max_visible_blocks, dtype=seq_lens.dtype, device=seq_lens.device
+    )
+    sink_mask = block_offsets[None, :] < sink_blocks[:, None]
+    source_block_numbers = torch.where(
+        sink_mask,
+        block_offsets[None, :],
+        (
+            recent_start_blocks[:, None]
+            + block_offsets[None, :]
+            - sink_blocks[:, None]
+        ),
+    )
+    valid_mask = block_offsets[None, :] < visible_blocks[:, None]
+    source_block_numbers = torch.where(
+        valid_mask, source_block_numbers, torch.zeros_like(source_block_numbers)
+    )
+
+    block_aligned_table = block_table.gather(
+        dim=1, index=source_block_numbers.to(torch.long)
+    )
+    sink_token_lengths = torch.minimum(seq_lens, sink_blocks * block_size)
+    recent_token_lengths = seq_lens - recent_start_blocks * block_size
+    visible_seq_lens = sink_token_lengths + recent_token_lengths
+    max_visible_seq_len = int(visible_seq_lens.max().item())
+    return block_aligned_table, visible_seq_lens, max_visible_seq_len
 
 
 if current_platform.is_rocm():
@@ -961,6 +1044,75 @@ class AiterFlashAttentionImpl(AttentionImpl):
         assert attn_metadata.decode_metadata is not None
         assert attn_metadata.decode_metadata.max_query_len == 1
         assert num_decode_tokens == num_decodes
+
+        if _self_swa_block_aligned_paged_attn_enabled():
+            block_table = attn_metadata.block_table[:num_decodes]
+            seq_lens = attn_metadata.seq_lens[:num_decodes]
+            block_aligned_block_table, block_aligned_seq_lens, max_visible_seq_len = (
+                _make_self_swa_block_aligned_metadata(
+                    block_table=block_table,
+                    seq_lens=seq_lens,
+                    sink_size=sink_size,
+                    recent_window=recent_window,
+                    block_size=key_cache.shape[1],
+                )
+            )
+
+            if _self_swa_debug_enabled():
+                logger.info(
+                    "aiter_fa self_swa block-aligned sink decode: layer=%s "
+                    "sink_size=%s recent_window=%s block_size=%s seq_lens=%s "
+                    "block_aligned_seq_lens=%s max_visible_seq_len=%s "
+                    "block_table_shape=%s",
+                    _layer_debug_name(layer),
+                    sink_size,
+                    recent_window,
+                    key_cache.shape[1],
+                    _tensor_debug(seq_lens),
+                    _tensor_debug(block_aligned_seq_lens),
+                    max_visible_seq_len,
+                    tuple(block_aligned_block_table.shape),
+                )
+
+            _, num_heads, head_size = query.shape
+            nbytes_per_qo_elem = torch.finfo(query.dtype).bits // 8
+            max_num_partitions = (
+                max_visible_seq_len + _PARTITION_SIZE_ROCM - 1
+            ) // _PARTITION_SIZE_ROCM
+            workspace_buffer = torch.empty(
+                (num_decodes * num_heads * max_num_partitions * head_size)
+                * nbytes_per_qo_elem
+                + 2 * (num_decodes * num_heads * max_num_partitions) * 4,
+                dtype=torch.uint8,
+                device=output.device,
+            )
+
+            # import so that aiter registers the op to torch.ops.aiter.
+            import aiter  # noqa: F401
+
+            torch.ops.aiter.paged_attention_v1(
+                output[:num_decode_tokens],
+                workspace_buffer,
+                query[:num_decode_tokens],
+                key_cache,
+                value_cache,
+                self.scale,
+                block_aligned_block_table,
+                attn_metadata.query_start_loc[:num_decodes],
+                block_aligned_seq_lens,
+                max_visible_seq_len,
+                self.alibi_slopes,
+                self.kv_cache_dtype,
+                "NHD",
+                self.logits_soft_cap,
+                layer._k_scale,
+                layer._v_scale,
+                None,
+                _PARTITION_SIZE_ROCM,
+                1,
+                max_visible_seq_len,
+            )
+            return
 
         seq_lens = attn_metadata.seq_lens[:num_decodes]
         sink_limit = torch.full_like(seq_lens, sink_size)

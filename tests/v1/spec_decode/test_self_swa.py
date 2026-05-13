@@ -4,9 +4,13 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from vllm.config import ParallelConfig, SpeculativeConfig, VllmConfig
 from vllm.forward_context import get_forward_context, set_forward_context
+from vllm.v1.attention.backends.rocm_aiter_fa import (
+    _make_self_swa_block_aligned_metadata,
+)
 from vllm.v1.spec_decode.self_swa import (
     SELF_SWA_FORWARD_CONTEXT_KEY,
     SELF_SWA_SINK_SIZE_FORWARD_CONTEXT_KEY,
@@ -95,3 +99,44 @@ def test_self_swa_forward_context_override_is_scoped():
         additional_kwargs = get_forward_context().additional_kwargs
         assert SELF_SWA_FORWARD_CONTEXT_KEY not in additional_kwargs
         assert SELF_SWA_SINK_SIZE_FORWARD_CONTEXT_KEY not in additional_kwargs
+
+
+def test_self_swa_block_aligned_metadata_rounds_sink_to_blocks():
+    block_table = torch.arange(32, dtype=torch.int32).reshape(2, 16)
+    seq_lens = torch.tensor([100, 33], dtype=torch.int32)
+
+    block_aligned_table, visible_seq_lens, max_visible_seq_len = (
+        _make_self_swa_block_aligned_metadata(
+            block_table=block_table,
+            seq_lens=seq_lens,
+            sink_size=17,
+            recent_window=20,
+            block_size=16,
+        )
+    )
+
+    assert block_aligned_table.tolist() == [
+        [0, 1, 5, 6],
+        [16, 17, 18, 16],
+    ]
+    assert visible_seq_lens.tolist() == [52, 33]
+    assert max_visible_seq_len == 52
+
+
+def test_self_swa_block_aligned_metadata_rounds_recent_start_down():
+    block_table = torch.arange(16, dtype=torch.int32).reshape(1, 16)
+    seq_lens = torch.tensor([100], dtype=torch.int32)
+
+    block_aligned_table, visible_seq_lens, max_visible_seq_len = (
+        _make_self_swa_block_aligned_metadata(
+            block_table=block_table,
+            seq_lens=seq_lens,
+            sink_size=4,
+            recent_window=19,
+            block_size=16,
+        )
+    )
+
+    assert block_aligned_table.tolist() == [[0, 5, 6]]
+    assert visible_seq_lens.tolist() == [36]
+    assert max_visible_seq_len == 36
