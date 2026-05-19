@@ -14,6 +14,7 @@ from vllm.v1.attention.backends.rocm_aiter_fa import (
 from vllm.v1.spec_decode.self_swa import (
     SELF_SWA_FORWARD_CONTEXT_KEY,
     SELF_SWA_SINK_SIZE_FORWARD_CONTEXT_KEY,
+    SelfSWAProposer,
 )
 
 
@@ -101,6 +102,50 @@ def test_self_swa_forward_context_override_is_scoped():
         assert SELF_SWA_SINK_SIZE_FORWARD_CONTEXT_KEY not in additional_kwargs
 
 
+def test_self_swa_local_argmax_uses_generic_logits_processor_path():
+    class _FakeLogitsProcessor:
+        def __init__(self):
+            self.called_with = None
+
+        def get_top_tokens(self, lm_head, hidden_states):
+            self.called_with = (lm_head, hidden_states)
+            return torch.tensor([7], device=hidden_states.device)
+
+    logits_processor = _FakeLogitsProcessor()
+    lm_head = object()
+    proposer = object.__new__(SelfSWAProposer)
+    proposer.model = SimpleNamespace(
+        logits_processor=logits_processor,
+        lm_head=lm_head,
+    )
+    hidden_states = torch.zeros(1, 4)
+
+    top_tokens = proposer._greedy_sample(hidden_states)
+
+    assert top_tokens.tolist() == [7]
+    assert logits_processor.called_with == (lm_head, hidden_states)
+
+
+def test_self_swa_local_argmax_falls_back_to_full_logits():
+    class _FakeModel:
+        def __init__(self):
+            self.called_with = None
+
+        def compute_logits(self, hidden_states):
+            self.called_with = hidden_states
+            return torch.tensor([[0.0, 4.0, 1.0]], device=hidden_states.device)
+
+    model = _FakeModel()
+    proposer = object.__new__(SelfSWAProposer)
+    proposer.model = model
+    hidden_states = torch.zeros(1, 4)
+
+    top_tokens = proposer._greedy_sample(hidden_states)
+
+    assert top_tokens.tolist() == [1]
+    assert model.called_with is hidden_states
+
+
 def test_self_swa_block_aligned_metadata_rounds_sink_to_blocks():
     block_table = torch.arange(32, dtype=torch.int32).reshape(2, 16)
     seq_lens = torch.tensor([100, 33], dtype=torch.int32)
@@ -140,3 +185,107 @@ def test_self_swa_block_aligned_metadata_rounds_recent_start_down():
     assert block_aligned_table.tolist() == [[0, 5, 6]]
     assert visible_seq_lens.tolist() == [36]
     assert max_visible_seq_len == 36
+
+
+@pytest.mark.parametrize(
+    ("sink_size", "window_size", "block_size", "seq_lens_values"),
+    [
+        (4, 8192, 16, [100000, 100001, 9000, 33]),
+        (17, 20, 16, [100, 64, 48, 33]),
+        (0, 8192, 16, [1_000_000, 8193, 4096, 1]),
+        (4, 19, 16, [100, 64, 48, 33]),
+    ],
+)
+def test_self_swa_reusable_block_aligned_metadata_matches_helper(
+    sink_size: int,
+    window_size: int,
+    block_size: int,
+    seq_lens_values: list[int],
+):
+    proposer = object.__new__(SelfSWAProposer)
+    proposer._self_swa_block_aligned_buffers_initialized = False
+    proposer.block_size = block_size
+    proposer.self_swa_sink_size = sink_size
+    proposer.self_swa_window_size = window_size
+    proposer.max_batch_size = len(seq_lens_values)
+    proposer.device = torch.device("cpu")
+    proposer._self_swa_max_visible_blocks = 0
+    proposer._self_swa_max_visible_seq_len = 0
+    proposer._self_swa_sink_block_limit = 0
+    for attr in (
+        "_self_swa_block_aligned_block_table",
+        "_self_swa_block_aligned_seq_lens",
+    ):
+        setattr(proposer, attr, None)
+
+    max_seq_len = max(seq_lens_values)
+    table_blocks = (max_seq_len + block_size - 1) // block_size
+    block_table = torch.arange(
+        len(seq_lens_values) * table_blocks, dtype=torch.int32
+    ).reshape(len(seq_lens_values), table_blocks)
+    seq_lens = torch.tensor(seq_lens_values, dtype=torch.int32)
+
+    reusable_table, reusable_seq_lens, reusable_max_seq_len = (
+        proposer._build_self_swa_block_aligned_metadata(
+            block_table=block_table,
+            seq_lens=seq_lens,
+            batch_size=len(seq_lens_values),
+        )
+    )
+    helper_table, helper_seq_lens, helper_max_seq_len = (
+        _make_self_swa_block_aligned_metadata(
+            block_table=block_table,
+            seq_lens=seq_lens,
+            sink_size=sink_size,
+            recent_window=window_size,
+            block_size=block_size,
+        )
+    )
+
+    assert torch.equal(reusable_table[:, : helper_table.shape[1]], helper_table)
+    assert torch.equal(reusable_seq_lens, helper_seq_lens)
+    assert reusable_max_seq_len >= helper_max_seq_len
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm")
+def test_self_swa_fused_block_aligned_metadata_matches_helper_on_gpu():
+    proposer = object.__new__(SelfSWAProposer)
+    proposer._self_swa_block_aligned_buffers_initialized = False
+    proposer.block_size = 16
+    proposer.self_swa_sink_size = 4
+    proposer.self_swa_window_size = 8192
+    proposer.max_batch_size = 4
+    proposer.device = torch.device("cuda")
+    proposer._self_swa_max_visible_blocks = 0
+    proposer._self_swa_max_visible_seq_len = 0
+    proposer._self_swa_sink_block_limit = 0
+    proposer._self_swa_block_aligned_block_table = None
+    proposer._self_swa_block_aligned_seq_lens = None
+
+    block_table = torch.arange(
+        4 * 7000, dtype=torch.int32, device="cuda"
+    ).reshape(4, 7000)
+    seq_lens = torch.tensor(
+        [100000, 100001, 9000, 33], dtype=torch.int32, device="cuda"
+    )
+
+    fused_table, fused_seq_lens, fused_max_seq_len = (
+        proposer._build_self_swa_block_aligned_metadata(
+            block_table=block_table,
+            seq_lens=seq_lens,
+            batch_size=4,
+        )
+    )
+    helper_table, helper_seq_lens, helper_max_seq_len = (
+        _make_self_swa_block_aligned_metadata(
+            block_table=block_table,
+            seq_lens=seq_lens,
+            sink_size=4,
+            recent_window=8192,
+            block_size=16,
+        )
+    )
+
+    assert torch.equal(fused_table[:, : helper_table.shape[1]], helper_table)
+    assert torch.equal(fused_seq_lens, helper_seq_lens)
+    assert fused_max_seq_len >= helper_max_seq_len

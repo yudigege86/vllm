@@ -7,20 +7,33 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
+from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
-from vllm.v1.spec_decode.utils import eagle_step_update_slot_mapping_and_metadata
+from vllm.v1.spec_decode.utils import (
+    eagle_step_update_slot_mapping_and_metadata,
+    self_swa_build_block_aligned_metadata,
+)
 
 # Experimental knobs for the first self-SWA prototype.
 SELF_SWA_WINDOW_SIZE = 4096
 SELF_SWA_FORWARD_CONTEXT_KEY = "self_swa_sliding_window"
 SELF_SWA_SINK_SIZE_FORWARD_CONTEXT_KEY = "self_swa_sink_size"
+SELF_SWA_BLOCK_ALIGNED_BLOCK_TABLE_FORWARD_CONTEXT_KEY = (
+    "self_swa_block_aligned_block_table"
+)
+SELF_SWA_BLOCK_ALIGNED_SEQ_LENS_FORWARD_CONTEXT_KEY = (
+    "self_swa_block_aligned_seq_lens"
+)
+SELF_SWA_BLOCK_ALIGNED_MAX_SEQ_LEN_FORWARD_CONTEXT_KEY = (
+    "self_swa_block_aligned_max_seq_len"
+)
 SELF_SWA_DEBUG_ENV = "VLLM_SELF_SWA_DEBUG"
 
 logger = init_logger(__name__)
@@ -84,10 +97,17 @@ class SelfSWAProposer(SpecDecodeBaseProposer):
         self._self_swa_visible_size = (
             self.self_swa_window_size + self.self_swa_sink_size
         )
+        self._self_swa_block_aligned_buffers_initialized = False
+        self._self_swa_max_visible_blocks = 0
+        self._self_swa_max_visible_seq_len = 0
+        self._self_swa_sink_block_limit = 0
+        self._self_swa_block_aligned_block_table: torch.Tensor | None = None
+        self._self_swa_block_aligned_seq_lens: torch.Tensor | None = None
         if _debug_enabled():
             logger.info(
                 "self_swa init: window=%s sink_size=%s visible_size=%s "
-                "num_speculative_tokens=%s max_model_len=%s",
+                "num_speculative_tokens=%s max_model_len=%s "
+                "block_aligned_paged=True",
                 self._self_swa_window,
                 self.self_swa_sink_size,
                 self._self_swa_visible_size,
@@ -123,6 +143,7 @@ class SelfSWAProposer(SpecDecodeBaseProposer):
         # Reuse the base AttentionGroup initialization, but with
         # _draft_attn_layer_names set to the target attention layers.
         super().initialize_attn_backend(kv_cache_config, kernel_block_sizes)
+        self._init_self_swa_block_aligned_buffers()
 
     def model_returns_tuple(self) -> bool:
         return False
@@ -130,6 +151,75 @@ class SelfSWAProposer(SpecDecodeBaseProposer):
     @staticmethod
     def _empty_drafts(batch_size: int) -> list[list[int]]:
         return [[] for _ in range(batch_size)]
+
+    def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._supports_local_argmax_reduction():
+            return self._get_top_tokens(hidden_states)
+        return self.model.compute_logits(hidden_states).argmax(dim=-1)
+
+    def _init_self_swa_block_aligned_buffers(self) -> None:
+        if (
+            self._self_swa_block_aligned_buffers_initialized
+            or self.block_size <= 0
+        ):
+            return
+
+        self._self_swa_sink_block_limit = cdiv(
+            self.self_swa_sink_size, self.block_size
+        )
+        # The recent region starts at floor((seq_len - window) / block_size), so
+        # it can include up to block_size - 1 extra tokens.
+        recent_blocks = cdiv(
+            self.self_swa_window_size + self.block_size - 1, self.block_size
+        )
+        self._self_swa_max_visible_blocks = (
+            self._self_swa_sink_block_limit + recent_blocks
+        )
+        self._self_swa_max_visible_seq_len = (
+            self._self_swa_sink_block_limit * self.block_size
+            + self.self_swa_window_size
+            + self.block_size
+            - 1
+        )
+        table_shape = (self.max_batch_size, self._self_swa_max_visible_blocks)
+        vector_shape = (self.max_batch_size,)
+        self._self_swa_block_aligned_block_table = torch.empty(
+            table_shape, dtype=torch.int32, device=self.device
+        )
+        self._self_swa_block_aligned_seq_lens = torch.empty(
+            vector_shape, dtype=torch.int32, device=self.device
+        )
+        self._self_swa_block_aligned_buffers_initialized = True
+
+    def _build_self_swa_block_aligned_metadata(
+        self,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        self._init_self_swa_block_aligned_buffers()
+        assert self._self_swa_block_aligned_block_table is not None
+        assert self._self_swa_block_aligned_seq_lens is not None
+
+        max_visible_blocks = self._self_swa_max_visible_blocks
+        block_aligned_block_table = self._self_swa_block_aligned_block_table[
+            :batch_size, :max_visible_blocks
+        ]
+        block_aligned_seq_lens = self._self_swa_block_aligned_seq_lens[:batch_size]
+        self_swa_build_block_aligned_metadata(
+            block_table=block_table[:batch_size],
+            seq_lens=seq_lens[:batch_size],
+            out_block_table=block_aligned_block_table,
+            out_seq_lens=block_aligned_seq_lens,
+            block_size=self.block_size,
+            sink_block_limit=self._self_swa_sink_block_limit,
+            self_swa_window_size=self.self_swa_window_size,
+        )
+        return (
+            block_aligned_block_table,
+            block_aligned_seq_lens,
+            self._self_swa_max_visible_seq_len,
+        )
 
     def propose(
         self,
@@ -209,36 +299,6 @@ class SelfSWAProposer(SpecDecodeBaseProposer):
         seq_lens = common_attn_metadata.seq_lens.clone()
         positions = target_positions[token_indices_to_sample].clone()
         input_ids = next_token_ids.int()
-        first_draft_positions = positions + 1
-        first_draft_block_numbers = first_draft_positions // self.block_size
-        first_draft_block_ids = common_attn_metadata.block_table_tensor.gather(
-            dim=1, index=first_draft_block_numbers[:, None]
-        ).squeeze(1)
-        has_unallocated_lookahead = bool((first_draft_block_ids <= 0).any().item())
-        if _debug_enabled():
-            logger.info(
-                "self_swa propose initial decode state: positions=%s seq_lens=%s "
-                "input_ids=%s first_draft_positions=%s "
-                "first_draft_block_numbers=%s first_draft_block_ids=%s "
-                "has_unallocated_lookahead=%s",
-                _tensor_debug(positions),
-                _tensor_debug(seq_lens),
-                _tensor_debug(input_ids),
-                _tensor_debug(first_draft_positions),
-                _tensor_debug(first_draft_block_numbers),
-                _tensor_debug(first_draft_block_ids),
-                has_unallocated_lookahead,
-            )
-        if has_unallocated_lookahead:
-            if _debug_enabled():
-                logger.info(
-                    "self_swa propose skip: missing lookahead KV block for "
-                    "first draft positions=%s block_numbers=%s block_ids=%s",
-                    _tensor_debug(first_draft_positions),
-                    _tensor_debug(first_draft_block_numbers),
-                    _tensor_debug(first_draft_block_ids),
-                )
-            return self._empty_drafts(batch_size)
 
         query_start_loc = self.arange[: batch_size + 1]
         query_start_loc_cpu = torch.from_numpy(
@@ -301,8 +361,36 @@ class SelfSWAProposer(SpecDecodeBaseProposer):
                 _seq_lens_cpu=None,
                 _num_computed_tokens_cpu=None,
             )
-            _, per_layer_attn_metadata = self.build_per_group_and_layer_attn_metadata(
-                draft_common_attn_metadata, draft_index=draft_index
+            _, per_layer_attn_metadata = (
+                self.build_per_group_and_layer_attn_metadata(
+                    draft_common_attn_metadata, draft_index=draft_index
+                )
+            )
+            additional_kwargs: dict[str, Any] = {
+                SELF_SWA_FORWARD_CONTEXT_KEY: self._self_swa_window,
+                SELF_SWA_SINK_SIZE_FORWARD_CONTEXT_KEY: self.self_swa_sink_size,
+            }
+            (
+                block_aligned_block_table,
+                block_aligned_seq_lens,
+                block_aligned_max_seq_len,
+            ) = self._build_self_swa_block_aligned_metadata(
+                block_table=common_attn_metadata.block_table_tensor,
+                seq_lens=seq_lens,
+                batch_size=batch_size,
+            )
+            additional_kwargs.update(
+                {
+                    SELF_SWA_BLOCK_ALIGNED_BLOCK_TABLE_FORWARD_CONTEXT_KEY: (
+                        block_aligned_block_table
+                    ),
+                    SELF_SWA_BLOCK_ALIGNED_SEQ_LENS_FORWARD_CONTEXT_KEY: (
+                        block_aligned_seq_lens
+                    ),
+                    SELF_SWA_BLOCK_ALIGNED_MAX_SEQ_LEN_FORWARD_CONTEXT_KEY: (
+                        block_aligned_max_seq_len
+                    ),
+                }
             )
             if _debug_enabled():
                 logger.info(
@@ -341,14 +429,8 @@ class SelfSWAProposer(SpecDecodeBaseProposer):
                 per_layer_attn_metadata,
                 self.vllm_config,
                 num_tokens=batch_size,
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
                 slot_mapping=slot_mapping,
-                additional_kwargs={
-                    SELF_SWA_FORWARD_CONTEXT_KEY: self._self_swa_window,
-                    SELF_SWA_SINK_SIZE_FORWARD_CONTEXT_KEY: (
-                        self.self_swa_sink_size
-                    ),
-                },
+                additional_kwargs=additional_kwargs,
             ):
                 ret_hidden_states = self.model(**model_kwargs)
                 if not self.model_returns_tuple():

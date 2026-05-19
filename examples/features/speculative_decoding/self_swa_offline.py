@@ -18,6 +18,7 @@ from argparse import BooleanOptionalAction, Namespace
 from contextlib import suppress
 from copy import copy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 # These environment variables must be set before importing vLLM.
@@ -78,10 +79,10 @@ class SweepResult:
     max_model_len: int
     num_spec_tokens: int
     self_swa_window_size: int
-    exact_match: bool
-    baseline_decode_tokens_per_s: float
+    exact_match: bool | None
+    baseline_decode_tokens_per_s: float | None
     self_swa_decode_tokens_per_s: float
-    speedup: float
+    speedup: float | None
     spec_metrics: SpecMetrics
 
 
@@ -99,6 +100,11 @@ def _env_is_true(value: str) -> bool:
 def validate_env(args: Namespace) -> None:
     uses_aiter_fa = args.attention_backend == "ROCM_AITER_FA"
     baseline_only = getattr(args, "baseline_only", False)
+    self_swa_only = getattr(args, "self_swa_only", False)
+    if baseline_only and self_swa_only:
+        raise RuntimeError(
+            "--baseline-only and --self-swa-only are mutually exclusive."
+        )
     if uses_aiter_fa and not _env_is_true(os.environ.get("VLLM_ROCM_USE_AITER", "0")):
         raise RuntimeError(
             "ROCM_AITER_FA requires VLLM_ROCM_USE_AITER=1. Use "
@@ -231,11 +237,54 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--profile-with-stack", action=BooleanOptionalAction, default=False
     )
+    parser.add_argument(
+        "--profile-record-shapes", action=BooleanOptionalAction, default=False
+    )
+    parser.add_argument(
+        "--profile-explicit",
+        action="store_true",
+        help=(
+            "Use explicit llm.start_profile()/stop_profile() around selected "
+            "generate() calls. This enables warmup before profiling."
+        ),
+    )
+    parser.add_argument(
+        "--profile-warmup-runs",
+        type=int,
+        default=0,
+        help="Number of unprofiled warmup generate() calls before profiled calls.",
+    )
+    parser.add_argument(
+        "--profile-separate-dirs",
+        action="store_true",
+        help=(
+            "When profiling, write each baseline/self-SWA case to its own "
+            "subdirectory under --profile-dir."
+        ),
+    )
+    parser.add_argument(
+        "--profile-split-prefill-decode",
+        action="store_true",
+        help=(
+            "For each profiled case, first profile a max_tokens=1 prefill-heavy "
+            "generate(), then profile the normal output length for decode analysis. "
+            "The decode profile reuses the same prompt so prefix caching can reuse "
+            "the prompt KV populated by the prefill probe."
+        ),
+    )
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument(
         "--baseline-only",
         action="store_true",
         help="Run only the greedy baseline, useful for backend crash isolation.",
+    )
+    parser.add_argument(
+        "--self-swa-only",
+        action="store_true",
+        help=(
+            "Run only self-SWA cases, useful for profiling self-SWA in a "
+            "separate process without producing an extra baseline trace."
+        ),
     )
     parser.add_argument("--print-output", action="store_true")
     return parser.parse_args()
@@ -370,7 +419,7 @@ def make_llm_kwargs(args: Namespace, speculative_config: dict[str, Any] | None) 
             "torch_profiler_dir": args.profile_dir,
             "torch_profiler_with_stack": args.profile_with_stack,
             "torch_profiler_with_memory": False,
-            "torch_profiler_record_shapes": False,
+            "torch_profiler_record_shapes": args.profile_record_shapes,
             "torch_profiler_with_flops": False,
             "torch_profiler_use_gzip": True,
             "torch_profiler_dump_cuda_time_total": True,
@@ -433,6 +482,76 @@ def _profile_prefix(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_") or "profile"
 
 
+def _with_profile_dir(args: Namespace, profile_dir: str | None) -> Namespace:
+    if args.profile_dir == profile_dir:
+        return args
+    updated = copy(args)
+    updated.profile_dir = profile_dir
+    return updated
+
+
+def _generate_once(
+    llm: LLM,
+    prompts: list[dict[str, list[int]]],
+    sampling_params: SamplingParams,
+):
+    return llm.generate(prompts, sampling_params, use_tqdm=True)
+
+
+def _profiled_generate_once(
+    name: str,
+    llm: LLM,
+    args: Namespace,
+    prompts: list[dict[str, list[int]]],
+    sampling_params: SamplingParams,
+):
+    if args.profile_dir is None:
+        return _generate_once(llm, prompts, sampling_params)
+
+    print(
+        f"Starting torch profiler: dir={args.profile_dir} "
+        f"prefix={_profile_prefix(name)}"
+    )
+    llm.start_profile(profile_prefix=_profile_prefix(name))
+    try:
+        return _generate_once(llm, prompts, sampling_params)
+    finally:
+        llm.stop_profile()
+        print(f"Stopped torch profiler: dir={args.profile_dir}")
+
+
+def _run_warmup_generations(
+    llm: LLM,
+    args: Namespace,
+    prompts: list[dict[str, list[int]]],
+    sampling_params: SamplingParams,
+) -> None:
+    if args.profile_warmup_runs <= 0:
+        return
+    for warmup_idx in range(args.profile_warmup_runs):
+        print(
+            f"Warmup generate {warmup_idx + 1}/{args.profile_warmup_runs} "
+            f"(max_tokens={sampling_params.max_tokens})"
+        )
+        _generate_once(llm, prompts, sampling_params)
+
+
+def _run_profile_prefill_probe(
+    name: str,
+    llm: LLM,
+    args: Namespace,
+    prompts: list[dict[str, list[int]]],
+) -> None:
+    if args.profile_dir is None or not args.profile_split_prefill_decode:
+        return
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=1)
+    print(
+        "Profiling max_tokens=1 prefill probe. The following decode profile "
+        "uses the same prompt so prefix caching can reuse prompt KV."
+    )
+    _profiled_generate_once(f"{name} prefill", llm, args, prompts, sampling_params)
+
+
 def run_generation(
     name: str,
     llm: LLM,
@@ -444,19 +563,15 @@ def run_generation(
         temperature=0.0,
         max_tokens=args.output_len,
     )
+    if args.profile_explicit:
+        _run_profile_prefill_probe(name, llm, args, prompts)
+        _run_warmup_generations(llm, args, prompts, sampling_params)
+
     start = time.perf_counter()
-    if args.profile_dir is not None:
-        print(
-            f"Starting torch profiler: dir={args.profile_dir} "
-            f"prefix={_profile_prefix(name)}"
-        )
-        llm.start_profile(profile_prefix=_profile_prefix(name))
-    try:
-        outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
-    finally:
-        if args.profile_dir is not None:
-            llm.stop_profile()
-            print(f"Stopped torch profiler: dir={args.profile_dir}")
+    if args.profile_dir is None:
+        outputs = _generate_once(llm, prompts, sampling_params)
+    else:
+        outputs = _profiled_generate_once(name, llm, args, prompts, sampling_params)
     elapsed_s = time.perf_counter() - start
     metrics = llm.get_metrics()
     token_ids = [list(output.outputs[0].token_ids) for output in outputs]
@@ -640,12 +755,17 @@ def run_baseline_sweep(
     baseline_results = {}
     llm: LLM | None = None
     try:
-        llm = create_llm(args, speculative_config=None)
+        baseline_args = args
+        if args.profile_dir is not None and args.profile_separate_dirs:
+            baseline_args = _with_profile_dir(
+                args, str(Path(args.profile_dir) / "baseline")
+            )
+        llm = create_llm(baseline_args, speculative_config=None)
         for case in prompt_cases:
             baseline_results[case.prompt_len] = run_generation(
                 f"baseline prompt_len={case.prompt_len}",
                 llm,
-                args,
+                baseline_args,
                 case.prompts,
             )
     finally:
@@ -668,7 +788,12 @@ def run_window_sweep(
     }
     llm: LLM | None = None
     try:
-        llm = create_llm(args, self_swa_config)
+        llm_args = args
+        if args.profile_dir is not None and args.profile_separate_dirs:
+            llm_args = _with_profile_dir(
+                args, str(Path(args.profile_dir) / f"self_swa_window_{window_size}")
+            )
+        llm = create_llm(llm_args, self_swa_config)
         for case in prompt_cases:
             is_eligible, reason = check_window_eligible(
                 case.prompt_len, window_size, args.self_swa_sink_size
@@ -688,20 +813,30 @@ def run_window_sweep(
                     f"self-SWA prompt_len={case.prompt_len} "
                     f"window_size={window_size}",
                     llm,
-                    args,
+                    llm_args,
                     case.prompts,
                 )
                 after_metrics = collect_spec_metrics(
                     self_swa.metrics, args.num_spec_tokens
                 )
                 spec_metrics = diff_spec_metrics(before_metrics, after_metrics)
-                baseline = baseline_results[case.prompt_len]
-                speedup = print_speed_comparison(baseline, self_swa)
-                exact_match = compare_outputs(
-                    baseline,
-                    self_swa,
-                    raise_on_mismatch=not args.continue_on_error,
-                )
+                baseline = baseline_results.get(case.prompt_len)
+                if baseline is None:
+                    print(
+                        "\nSkipping baseline comparison because "
+                        "--self-swa-only was set."
+                    )
+                    speedup = None
+                    exact_match = None
+                    baseline_decode_tokens_per_s = None
+                else:
+                    speedup = print_speed_comparison(baseline, self_swa)
+                    exact_match = compare_outputs(
+                        baseline,
+                        self_swa,
+                        raise_on_mismatch=not args.continue_on_error,
+                    )
+                    baseline_decode_tokens_per_s = baseline.decode_tokens_per_s
                 print_spec_metrics(spec_metrics)
                 results.append(
                     SweepResult(
@@ -711,7 +846,7 @@ def run_window_sweep(
                         num_spec_tokens=args.num_spec_tokens,
                         self_swa_window_size=window_size,
                         exact_match=exact_match,
-                        baseline_decode_tokens_per_s=baseline.decode_tokens_per_s,
+                        baseline_decode_tokens_per_s=baseline_decode_tokens_per_s,
                         self_swa_decode_tokens_per_s=self_swa.decode_tokens_per_s,
                         speedup=speedup,
                         spec_metrics=spec_metrics,
@@ -743,7 +878,9 @@ def run_sweep(
     sweep_args = make_sweep_args(args, prompt_lens, num_spec_tokens_values)
     print(f"max_model_len: {sweep_args.max_model_len}")
     prompt_cases = build_prompt_cases(sweep_args, tokenizer, prompt_lens)
-    baseline_results = run_baseline_sweep(sweep_args, prompt_cases)
+    baseline_results = {}
+    if not args.self_swa_only:
+        baseline_results = run_baseline_sweep(sweep_args, prompt_cases)
     if args.baseline_only:
         return []
 
@@ -779,15 +916,22 @@ def print_sweep_summary(results: list[SweepResult]) -> None:
         "speedup\tnum_drafts\tmean_acceptance_length"
     )
     for result in results:
+        exact_match = "n/a" if result.exact_match is None else str(result.exact_match)
+        baseline_tps = (
+            "n/a"
+            if result.baseline_decode_tokens_per_s is None
+            else f"{result.baseline_decode_tokens_per_s:.2f}"
+        )
+        speedup = "n/a" if result.speedup is None else f"{result.speedup:.2f}"
         print(
             f"{result.prompt_len}\t"
             f"{result.max_model_len}\t"
             f"{result.num_spec_tokens}\t"
             f"{result.self_swa_window_size}\t"
-            f"{result.exact_match}\t"
-            f"{result.baseline_decode_tokens_per_s:.2f}\t"
+            f"{exact_match}\t"
+            f"{baseline_tps}\t"
             f"{result.self_swa_decode_tokens_per_s:.2f}\t"
-            f"{result.speedup:.2f}\t"
+            f"{speedup}\t"
             f"{result.spec_metrics.num_drafts}\t"
             f"{result.spec_metrics.mean_acceptance_length:.2f}"
         )
@@ -807,7 +951,13 @@ def main() -> None:
     print(f"num_prompts: {args.num_prompts}")
     print(f"num_spec_tokens: {num_spec_tokens_values}")
     print(f"baseline_only: {args.baseline_only}")
+    print(f"self_swa_only: {args.self_swa_only}")
     print(f"profile_dir: {args.profile_dir}")
+    print(f"profile_explicit: {args.profile_explicit}")
+    print(f"profile_warmup_runs: {args.profile_warmup_runs}")
+    print(f"profile_record_shapes: {args.profile_record_shapes}")
+    print(f"profile_separate_dirs: {args.profile_separate_dirs}")
+    print(f"profile_split_prefill_decode: {args.profile_split_prefill_decode}")
     print(f"hf_overrides: {args.hf_overrides}")
     print(
         "VLLM_ALLOW_LONG_MAX_MODEL_LEN="

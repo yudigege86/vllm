@@ -407,8 +407,33 @@ class SpecDecodeBaseProposer:
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Greedy-sample draft tokens from hidden states."""
         if self.use_local_argmax_reduction:
-            return self.model.get_top_tokens(hidden_states)
+            return self._get_top_tokens(hidden_states)
         return self.model.compute_logits(hidden_states).argmax(dim=-1)
+
+    def _supports_local_argmax_reduction(self) -> bool:
+        if hasattr(self.model, "get_top_tokens"):
+            return True
+        logits_processor = getattr(self.model, "logits_processor", None)
+        return (
+            logits_processor is not None
+            and hasattr(logits_processor, "get_top_tokens")
+            and hasattr(self.model, "lm_head")
+        )
+
+    def _get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if hasattr(self.model, "get_top_tokens"):
+            return self.model.get_top_tokens(hidden_states)
+
+        logits_processor = getattr(self.model, "logits_processor", None)
+        lm_head = getattr(self.model, "lm_head", None)
+        if logits_processor is not None and lm_head is not None:
+            return logits_processor.get_top_tokens(lm_head, hidden_states)
+
+        raise ValueError(
+            "use_local_argmax_reduction is enabled but draft model "
+            f"{self.model.__class__.__name__} does not support local argmax "
+            "reduction."
+        )
 
     def propose(
         self,
@@ -1549,11 +1574,11 @@ class SpecDecodeBaseProposer:
             )
 
         if self.use_local_argmax_reduction:
-            if not hasattr(self.model, "get_top_tokens"):
+            if not self._supports_local_argmax_reduction():
                 raise ValueError(
                     "use_local_argmax_reduction is enabled but draft model "
-                    f"{self.model.__class__.__name__} does not implement "
-                    "get_top_tokens()."
+                    f"{self.model.__class__.__name__} does not support local "
+                    "argmax reduction."
                 )
             # Warn if draft model has vocab remapping, which forces fallback
             # to the full-logits path (negating the optimization).

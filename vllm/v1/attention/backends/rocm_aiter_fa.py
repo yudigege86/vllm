@@ -39,25 +39,14 @@ _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 _SELF_SWA_FORWARD_CONTEXT_KEY = "self_swa_sliding_window"
 _SELF_SWA_SINK_SIZE_FORWARD_CONTEXT_KEY = "self_swa_sink_size"
+_SELF_SWA_BLOCK_ALIGNED_BLOCK_TABLE_KEY = "self_swa_block_aligned_block_table"
+_SELF_SWA_BLOCK_ALIGNED_SEQ_LENS_KEY = "self_swa_block_aligned_seq_lens"
+_SELF_SWA_BLOCK_ALIGNED_MAX_SEQ_LEN_KEY = "self_swa_block_aligned_max_seq_len"
 _SELF_SWA_DEBUG_ENV = "VLLM_SELF_SWA_DEBUG"
-_SELF_SWA_BLOCK_ALIGNED_PAGED_ATTN_ENV = (
-    "VLLM_SELF_SWA_BLOCK_ALIGNED_PAGED_ATTN"
-)
 
 
 def _self_swa_debug_enabled() -> bool:
     return os.environ.get(_SELF_SWA_DEBUG_ENV, "0").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
-
-def _self_swa_block_aligned_paged_attn_enabled() -> bool:
-    return os.environ.get(
-        _SELF_SWA_BLOCK_ALIGNED_PAGED_ATTN_ENV, "0"
-    ).lower() in (
         "1",
         "true",
         "yes",
@@ -974,6 +963,8 @@ class AiterFlashAttentionImpl(AttentionImpl):
         else:
             self.sliding_window = (sliding_window - 1, 0)
         self.kv_cache_dtype = kv_cache_dtype
+        self._self_swa_workspace_buffer: torch.Tensor | None = None
+        self._self_swa_workspace_num_bytes = 0
         if logits_soft_cap is None:
             # In flash-attn, setting logits_soft_cap as 0 means no soft cap.
             logits_soft_cap = 0.0
@@ -1014,6 +1005,37 @@ class AiterFlashAttentionImpl(AttentionImpl):
             )
         )
 
+    def _get_self_swa_block_aligned_metadata(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, int] | None:
+        try:
+            forward_context = get_forward_context()
+        except AssertionError:
+            return None
+        kwargs = forward_context.additional_kwargs
+        block_table = kwargs.get(_SELF_SWA_BLOCK_ALIGNED_BLOCK_TABLE_KEY)
+        seq_lens = kwargs.get(_SELF_SWA_BLOCK_ALIGNED_SEQ_LENS_KEY)
+        max_seq_len = kwargs.get(_SELF_SWA_BLOCK_ALIGNED_MAX_SEQ_LEN_KEY)
+        if block_table is None or seq_lens is None or max_seq_len is None:
+            return None
+        return block_table, seq_lens, int(max_seq_len)
+
+    def _get_self_swa_workspace_buffer(
+        self,
+        num_bytes: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if (
+            self._self_swa_workspace_buffer is None
+            or self._self_swa_workspace_num_bytes < num_bytes
+            or self._self_swa_workspace_buffer.device != device
+        ):
+            self._self_swa_workspace_buffer = torch.empty(
+                num_bytes, dtype=torch.uint8, device=device
+            )
+            self._self_swa_workspace_num_bytes = num_bytes
+        return self._self_swa_workspace_buffer[:num_bytes]
+
     def _self_swa_sink_decode_forward(
         self,
         layer: torch.nn.Module,
@@ -1045,174 +1067,78 @@ class AiterFlashAttentionImpl(AttentionImpl):
         assert attn_metadata.decode_metadata.max_query_len == 1
         assert num_decode_tokens == num_decodes
 
-        if _self_swa_block_aligned_paged_attn_enabled():
+        precomputed_metadata = self._get_self_swa_block_aligned_metadata()
+        if precomputed_metadata is None:
             block_table = attn_metadata.block_table[:num_decodes]
             seq_lens = attn_metadata.seq_lens[:num_decodes]
-            block_aligned_block_table, block_aligned_seq_lens, max_visible_seq_len = (
-                _make_self_swa_block_aligned_metadata(
-                    block_table=block_table,
-                    seq_lens=seq_lens,
-                    sink_size=sink_size,
-                    recent_window=recent_window,
-                    block_size=key_cache.shape[1],
-                )
+            precomputed_metadata = _make_self_swa_block_aligned_metadata(
+                block_table=block_table,
+                seq_lens=seq_lens,
+                sink_size=sink_size,
+                recent_window=recent_window,
+                block_size=key_cache.shape[1],
             )
-
-            if _self_swa_debug_enabled():
-                logger.info(
-                    "aiter_fa self_swa block-aligned sink decode: layer=%s "
-                    "sink_size=%s recent_window=%s block_size=%s seq_lens=%s "
-                    "block_aligned_seq_lens=%s max_visible_seq_len=%s "
-                    "block_table_shape=%s",
-                    _layer_debug_name(layer),
-                    sink_size,
-                    recent_window,
-                    key_cache.shape[1],
-                    _tensor_debug(seq_lens),
-                    _tensor_debug(block_aligned_seq_lens),
-                    max_visible_seq_len,
-                    tuple(block_aligned_block_table.shape),
-                )
-
-            _, num_heads, head_size = query.shape
-            nbytes_per_qo_elem = torch.finfo(query.dtype).bits // 8
-            max_num_partitions = (
-                max_visible_seq_len + _PARTITION_SIZE_ROCM - 1
-            ) // _PARTITION_SIZE_ROCM
-            workspace_buffer = torch.empty(
-                (num_decodes * num_heads * max_num_partitions * head_size)
-                * nbytes_per_qo_elem
-                + 2 * (num_decodes * num_heads * max_num_partitions) * 4,
-                dtype=torch.uint8,
-                device=output.device,
-            )
-
-            # import so that aiter registers the op to torch.ops.aiter.
-            import aiter  # noqa: F401
-
-            torch.ops.aiter.paged_attention_v1(
-                output[:num_decode_tokens],
-                workspace_buffer,
-                query[:num_decode_tokens],
-                key_cache,
-                value_cache,
-                self.scale,
-                block_aligned_block_table,
-                attn_metadata.query_start_loc[:num_decodes],
-                block_aligned_seq_lens,
-                max_visible_seq_len,
-                self.alibi_slopes,
-                self.kv_cache_dtype,
-                "NHD",
-                self.logits_soft_cap,
-                layer._k_scale,
-                layer._v_scale,
-                None,
-                _PARTITION_SIZE_ROCM,
-                1,
-                max_visible_seq_len,
-            )
-            return
-
-        seq_lens = attn_metadata.seq_lens[:num_decodes]
-        sink_limit = torch.full_like(seq_lens, sink_size)
-        sink_lengths = torch.minimum(seq_lens, sink_limit)
-        recent_starts = torch.maximum(
-            sink_lengths, seq_lens - torch.full_like(seq_lens, recent_window)
-        )
-        recent_lengths = seq_lens - recent_starts
-        visible_seq_lens = sink_lengths + recent_lengths
-        total_visible_tokens = int(visible_seq_lens.sum().item())
-        max_visible_seq_len = int(visible_seq_lens.max().item())
-
-        segment_lengths = torch.stack((sink_lengths, recent_lengths), dim=1).reshape(-1)
-        segment_starts = torch.stack(
-            (torch.zeros_like(sink_lengths), recent_starts), dim=1
-        ).reshape(-1)
-        segment_cu_seqlens = torch.cat(
-            (
-                torch.zeros(1, dtype=torch.int32, device=query.device),
-                torch.cumsum(segment_lengths, dim=0, dtype=torch.int32),
-            )
-        )
-        visible_cu_seqlens = torch.cat(
-            (
-                torch.zeros(1, dtype=torch.int32, device=query.device),
-                torch.cumsum(visible_seq_lens, dim=0, dtype=torch.int32),
-            )
-        )
-        token_to_segment = torch.repeat_interleave(
-            torch.arange(
-                segment_lengths.numel(), dtype=torch.int32, device=query.device
-            ),
-            segment_lengths.to(torch.int64),
-        )
-        expanded_block_table = torch.repeat_interleave(
-            attn_metadata.block_table[:num_decodes], repeats=2, dim=0
-        )
-
-        gathered_key = torch.empty(
-            (total_visible_tokens, self.num_kv_heads, key_cache.shape[-1]),
-            dtype=key_cache.dtype,
-            device=query.device,
-        )
-        gathered_value = torch.empty(
-            (total_visible_tokens, self.num_kv_heads, value_cache.shape[-1]),
-            dtype=value_cache.dtype,
-            device=query.device,
-        )
+        (
+            block_aligned_block_table,
+            block_aligned_seq_lens,
+            max_visible_seq_len,
+        ) = precomputed_metadata
 
         if _self_swa_debug_enabled():
             logger.info(
-                "aiter_fa self_swa sink decode: layer=%s sink_size=%s "
-                "recent_window=%s seq_lens=%s sink_lengths=%s "
-                "recent_starts=%s recent_lengths=%s visible_seq_lens=%s "
-                "total_visible_tokens=%s max_visible_seq_len=%s",
+                "aiter_fa self_swa block-aligned sink decode: layer=%s "
+                "sink_size=%s recent_window=%s block_size=%s "
+                "block_aligned_seq_lens=%s max_visible_seq_len=%s "
+                "block_table_shape=%s",
                 _layer_debug_name(layer),
                 sink_size,
                 recent_window,
-                _tensor_debug(seq_lens),
-                _tensor_debug(sink_lengths),
-                _tensor_debug(recent_starts),
-                _tensor_debug(recent_lengths),
-                _tensor_debug(visible_seq_lens),
-                total_visible_tokens,
+                key_cache.shape[1],
+                _tensor_debug(block_aligned_seq_lens),
                 max_visible_seq_len,
+                tuple(block_aligned_block_table.shape),
             )
 
-        cp_mha_gather_cache(
-            key_cache=key_cache,
-            value_cache=value_cache,
-            key=gathered_key,
-            value=gathered_value,
-            block_tables=expanded_block_table,
-            k_scales=layer._k_scale,
-            v_scales=layer._v_scale,
-            cu_seqlens_kv=segment_cu_seqlens,
-            token_to_batch=token_to_segment,
-            seq_starts=segment_starts,
-            dequant=is_quantized_kv_cache(self.kv_cache_dtype),
-            kv_cache_layout="NHD",
-            total_tokens=total_visible_tokens,
+        _, num_heads, head_size = query.shape
+        nbytes_per_qo_elem = torch.finfo(query.dtype).bits // 8
+        max_num_partitions = (
+            max_visible_seq_len + _PARTITION_SIZE_ROCM - 1
+        ) // _PARTITION_SIZE_ROCM
+        workspace_num_bytes = (
+            (num_decodes * num_heads * max_num_partitions * head_size)
+            * nbytes_per_qo_elem
+            + 2 * (num_decodes * num_heads * max_num_partitions) * 4
+        )
+        workspace_buffer = self._get_self_swa_workspace_buffer(
+            workspace_num_bytes, output.device
         )
 
-        rocm_aiter_ops.flash_attn_varlen_func(
-            q=query[:num_decode_tokens],
-            k=gathered_key,
-            v=gathered_value,
-            cu_seqlens_q=attn_metadata.query_start_loc[: num_decodes + 1],
-            cu_seqlens_k=visible_cu_seqlens,
-            max_seqlen_q=1,
-            max_seqlen_k=max_visible_seq_len,
-            min_seqlen_q=1,
-            dropout_p=0.0,
-            softmax_scale=self.scale,
-            causal=True,
-            window_size=(-1, -1),
-            alibi_slopes=None,
-            return_lse=False,
-            out=output[:num_decode_tokens],
+        # import so that aiter registers the op to torch.ops.aiter.
+        import aiter  # noqa: F401
+
+        torch.ops.aiter.paged_attention_v1(
+            output[:num_decode_tokens],
+            workspace_buffer,
+            query[:num_decode_tokens],
+            key_cache,
+            value_cache,
+            self.scale,
+            block_aligned_block_table,
+            attn_metadata.query_start_loc[:num_decodes],
+            block_aligned_seq_lens,
+            max_visible_seq_len,
+            self.alibi_slopes,
+            self.kv_cache_dtype,
+            "NHD",
+            self.logits_soft_cap,
+            layer._k_scale,
+            layer._v_scale,
+            None,
+            _PARTITION_SIZE_ROCM,
+            1,
+            max_visible_seq_len,
         )
+        return
 
     def extend_for_sliding_window(
         self,

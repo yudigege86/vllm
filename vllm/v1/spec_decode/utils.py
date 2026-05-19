@@ -134,6 +134,139 @@ def eagle_step_update_slot_mapping_and_metadata(
 
 
 @triton.jit
+def self_swa_block_aligned_metadata_kernel(
+    block_table_ptr,  # [batch_size, n_blocks_per_req]
+    seq_lens_ptr,  # [batch_size]
+    out_block_table_ptr,  # [batch_size, max_visible_blocks]
+    out_seq_lens_ptr,  # [batch_size]
+    block_table_stride,  # stride for block_table dim 0
+    out_block_table_stride,  # stride for out_block_table dim 0
+    block_size: tl.constexpr,
+    sink_block_limit: tl.constexpr,
+    self_swa_window_size: tl.constexpr,
+    max_visible_blocks: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    block_idx = tl.program_id(1)
+    offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offsets_mask = offsets < max_visible_blocks
+
+    seq_len = tl.load(seq_lens_ptr + req_idx)
+    seq_blocks = (seq_len + block_size - 1) // block_size
+    sink_blocks = tl.minimum(seq_blocks, sink_block_limit)
+
+    recent_start = seq_len - self_swa_window_size
+    recent_start = tl.maximum(recent_start, 0)
+    recent_start_blocks = recent_start // block_size
+    recent_start_blocks = tl.maximum(recent_start_blocks, sink_blocks)
+
+    recent_blocks = seq_blocks - recent_start_blocks
+    visible_blocks = sink_blocks + recent_blocks
+    source_block_numbers = offsets + recent_start_blocks - sink_blocks
+    source_block_numbers = tl.where(
+        offsets < sink_blocks, offsets, source_block_numbers
+    )
+    valid_offsets = offsets < visible_blocks
+    source_block_numbers = tl.where(valid_offsets, source_block_numbers, 0)
+
+    block_ids = tl.load(
+        block_table_ptr + req_idx * block_table_stride + source_block_numbers,
+        mask=offsets_mask,
+        other=0,
+    )
+    tl.store(
+        out_block_table_ptr + req_idx * out_block_table_stride + offsets,
+        block_ids,
+        mask=offsets_mask,
+    )
+
+    visible_seq_len = (
+        sink_blocks * block_size + seq_len - recent_start_blocks * block_size
+    )
+    tl.store(out_seq_lens_ptr + req_idx, visible_seq_len, mask=block_idx == 0)
+
+
+def _self_swa_block_aligned_metadata_torch(
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out_block_table: torch.Tensor,
+    out_seq_lens: torch.Tensor,
+    block_size: int,
+    sink_block_limit: int,
+    self_swa_window_size: int,
+) -> None:
+    batch_size, max_visible_blocks = out_block_table.shape
+    for req_idx in range(batch_size):
+        seq_len = int(seq_lens[req_idx].item())
+        seq_blocks = (seq_len + block_size - 1) // block_size
+        sink_blocks = min(seq_blocks, sink_block_limit)
+        recent_start = max(seq_len - self_swa_window_size, 0)
+        recent_start_blocks = max(recent_start // block_size, sink_blocks)
+        recent_blocks = seq_blocks - recent_start_blocks
+        visible_blocks = sink_blocks + recent_blocks
+        visible_seq_len = (
+            sink_blocks * block_size + seq_len - recent_start_blocks * block_size
+        )
+        out_seq_lens[req_idx] = visible_seq_len
+        for offset in range(max_visible_blocks):
+            if offset < sink_blocks:
+                source_block_number = offset
+            elif offset >= visible_blocks:
+                source_block_number = 0
+            else:
+                source_block_number = offset + recent_start_blocks - sink_blocks
+            out_block_table[req_idx, offset] = block_table[
+                req_idx, source_block_number
+            ]
+
+
+def self_swa_build_block_aligned_metadata(
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out_block_table: torch.Tensor,
+    out_seq_lens: torch.Tensor,
+    block_size: int,
+    sink_block_limit: int,
+    self_swa_window_size: int,
+) -> None:
+    """Build self-SWA block-aligned metadata into preallocated outputs."""
+    batch_size, max_visible_blocks = out_block_table.shape
+    if batch_size == 0:
+        return
+
+    if not block_table.is_cuda:
+        _self_swa_block_aligned_metadata_torch(
+            block_table=block_table,
+            seq_lens=seq_lens,
+            out_block_table=out_block_table,
+            out_seq_lens=out_seq_lens,
+            block_size=block_size,
+            sink_block_limit=sink_block_limit,
+            self_swa_window_size=self_swa_window_size,
+        )
+        return
+
+    block_size_power_of_2 = min(next_power_of_2(max_visible_blocks), 1024)
+    num_blocks = (max_visible_blocks + block_size_power_of_2 - 1) // (
+        block_size_power_of_2
+    )
+    self_swa_block_aligned_metadata_kernel[(batch_size, num_blocks)](
+        block_table,
+        seq_lens,
+        out_block_table,
+        out_seq_lens,
+        block_table.stride(0),
+        out_block_table.stride(0),
+        block_size=block_size,
+        sink_block_limit=sink_block_limit,
+        self_swa_window_size=self_swa_window_size,
+        max_visible_blocks=max_visible_blocks,
+        BLOCK_SIZE=block_size_power_of_2,
+    )
+
+
+@triton.jit
 def eagle_prepare_inputs_padded_kernel(
     cu_num_draft_tokens_ptr,  # [num_reqs]
     valid_sampled_tokens_count_ptr,  # [num_reqs]

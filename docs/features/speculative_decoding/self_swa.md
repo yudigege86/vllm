@@ -2,19 +2,34 @@
 
 Self-SWA speculative decoding is an experimental greedy-only method that uses
 the target model itself as the drafter. The draft pass temporarily keeps the
-initial attention-sink tokens plus a fixed recent sliding-window during decode,
+initial attention-sink tokens plus a fixed recent sliding window during decode,
 writes provisional KV into the target request's lookahead slots, and lets the
-normal full-attention target pass verify the draft tokens. Set
-`self_swa_sink_size` to `0` to recover pure sliding-window drafting.
+normal full-attention target pass verify the draft tokens. Use greedy sampling
+(`temperature=0.0`) when validating self-SWA output exactness.
 
 This method is intended for standard decoder-only, full-attention models with
 very long contexts, where the sliding-window draft can be cheaper than full
 attention after the prompt exceeds the configured window size.
 
+## Attention Sink Path
+
+Self-SWA uses a block-aligned paged draft attention path. The draft attention
+rounds the configured sink and recent regions outward to KV block boundaries,
+builds synthetic block tables, and runs paged attention over those blocks.
+For example, with a 16-token KV block size, `self_swa_sink_size=4` and
+`self_swa_sink_size=16` both keep one full sink block.
+
+The block-aligned paged path is ROCm AITER focused and still experimental. It
+requires shuffle KV cache layout to be disabled:
+
+```bash
+export VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=False
+```
+
 ## Manual ROCm Validation
 
-The first validation target is `Qwen/Qwen2.5-7B-Instruct-1M` on ROCm AITER.
-Before testing, keep shuffle KV cache disabled:
+One validation target is `Qwen/Qwen2.5-7B-Instruct-1M` on ROCm AITER. Before
+testing, keep shuffle KV cache disabled:
 
 ```bash
 export VLLM_ROCM_USE_AITER=1
@@ -48,8 +63,11 @@ assert baseline_outputs[0].outputs[0].token_ids == (
 )
 ```
 
-After exactness is confirmed, sweep `num_speculative_tokens` values such as
-`2`, `4`, and `8`, and record acceptance length, tokens/sec, and draft overhead.
-You can also compare `self_swa_sink_size=4` against `0`; the former follows the
-StreamingLLM-style pattern of keeping initial sink tokens plus recent tokens,
-without extending the model's long-term memory.
+After exactness is confirmed, sweep `num_speculative_tokens` values and record
+acceptance length, tokens/sec, and draft overhead. You can also compare
+different `self_swa_sink_size` values to measure the effect of keeping initial
+sink blocks plus recent blocks. See
+[`self_swa_sink_sweep_results.md`](../../../examples/features/speculative_decoding/self_swa_sink_sweep_results.md)
+for benchmark notes, including TP=4 eager block-aligned runs that exact-matched
+completed greedy baselines and improved long-context decode throughput in those
+tests.
