@@ -1,11 +1,21 @@
 {
   "name": "vLLM ROCm Nightly",
   "image": "vllm/vllm-openai-rocm:nightly",
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "username": "vscode",
+      "uid": "automatic",
+      "gid": "automatic",
+      "installZsh": false,
+      "installOhMyZsh": false,
+      "upgradePackages": false
+    }
+  },
   "workspaceFolder": "/workspace/vllm",
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace/vllm,type=bind,consistency=cached",
-  "initializeCommand": "mkdir -p /home/naqin/vllm/.tmp /apps/naqin/huggingface",
-  "remoteUser": "root",
-  "containerUser": "root",
+  "initializeCommand": "mkdir -p /home/naqin/vllm/.tmp /home/naqin/.cache/vllm /home/naqin/.cache/torch /apps/naqin/huggingface",
+  "remoteUser": "vscode",
+  "updateRemoteUserUID": true,
   "userEnvProbe": "loginInteractiveShell",
   "overrideCommand": true,
   "runArgs": [
@@ -23,8 +33,8 @@
     "--ipc=host"
   ],
   "containerEnv": {
-    "HOME": "/root",
-    "HF_HOME": "/root/.cache/huggingface",
+    "HOME": "/home/vscode",
+    "HF_HOME": "/home/vscode/.cache/huggingface",
     "HUGGING_FACE_HUB_TOKEN": "${localEnv:HF_TOKEN}",
     "HF_TOKEN": "${localEnv:HF_TOKEN}",
     "PYTHONPATH": "/workspace/vllm",
@@ -37,18 +47,19 @@
     "VLLM_CACHE_ROOT": "/tmp/vllm-cache"
   },
   "remoteEnv": {
-    "HOME": "/root",
+    "HOME": "/home/vscode",
     "SHELL": "/bin/bash"
   },
   "mounts": [
-    "source=/apps/naqin/huggingface,target=/root/.cache/huggingface,type=bind,consistency=cached",
-    "source=/home/naqin/.cache/vllm,target=/root/.cache/vllm,type=bind,consistency=cached",
-    "source=/home/naqin/.cache/torch,target=/root/.cache/torch,type=bind,consistency=cached",
-    "source=/home/naqin/.ssh,target=/root/.ssh,type=bind,readonly",
-    "source=/home/naqin/.gitconfig,target=/root/.gitconfig.host,type=bind,readonly",
-    "source=/home/naqin/.gitignore,target=/root/.gitignore.host,type=bind,readonly"
+    "source=/apps,target=/apps,type=bind,consistency=cached",
+    "source=/apps/naqin/huggingface,target=/home/vscode/.cache/huggingface,type=bind,consistency=cached",
+    "source=/home/naqin/.cache/vllm,target=/home/vscode/.cache/vllm,type=bind,consistency=cached",
+    "source=/home/naqin/.cache/torch,target=/home/vscode/.cache/torch,type=bind,consistency=cached",
+    "source=/home/naqin/.ssh,target=/home/vscode/.ssh,type=bind,readonly",
+    "source=/home/naqin/.gitconfig,target=/home/vscode/.gitconfig.host,type=bind,readonly",
+    "source=/home/naqin/.gitignore,target=/home/vscode/.gitignore_global,type=bind,readonly"
   ],
-  "postCreateCommand": "mkdir -p /workspace/vllm/.tmp /root/.cache/huggingface /root/.cache/vllm /root/.cache/torch && cp /root/.gitconfig.host /root/.gitconfig && cp /root/.gitignore.host /root/.gitignore && git config --global --add safe.directory /workspace/vllm && (WORKSPACE_UID=$(stat -c '%u' /workspace/vllm) && WORKSPACE_GID=$(stat -c '%g' /workspace/vllm) && (setpriv --reuid=$WORKSPACE_UID --regid=$WORKSPACE_GID --clear-groups env HOME=/workspace/vllm TMPDIR=/workspace/vllm/.tmp VLLM_TARGET_DEVICE=rocm VLLM_USE_PRECOMPILED=1 PYTHONPATH=/workspace/vllm /usr/bin/python setup.py build_ext --inplace; test -e /workspace/vllm/vllm/_C*.so -a -e /workspace/vllm/vllm/_rocm_C*.so) || setpriv --reuid=$WORKSPACE_UID --regid=$WORKSPACE_GID --clear-groups env HOME=/workspace/vllm TMPDIR=/workspace/vllm/.tmp VLLM_TARGET_DEVICE=rocm VLLM_USE_PRECOMPILED=0 PYTHONPATH=/workspace/vllm /usr/bin/python setup.py build_ext --inplace)",
+  "postCreateCommand": "mkdir -p /workspace/vllm/.tmp /home/vscode/.cache/huggingface /home/vscode/.cache/vllm /home/vscode/.cache/torch && cp /home/vscode/.gitconfig.host /home/vscode/.gitconfig && git config --global core.excludesfile /home/vscode/.gitignore_global && git config --global --add safe.directory /workspace/vllm && (HOME=/workspace/vllm TMPDIR=/workspace/vllm/.tmp VLLM_TARGET_DEVICE=rocm VLLM_USE_PRECOMPILED=1 PYTHONPATH=/workspace/vllm /usr/bin/python setup.py build_ext --inplace; test -e /workspace/vllm/vllm/_C*.so -a -e /workspace/vllm/vllm/_rocm_C*.so) || HOME=/workspace/vllm TMPDIR=/workspace/vllm/.tmp VLLM_TARGET_DEVICE=rocm VLLM_USE_PRECOMPILED=0 PYTHONPATH=/workspace/vllm /usr/bin/python setup.py build_ext --inplace",
   "postAttachCommand": "git status --short --branch",
   "forwardPorts": [
     8000
