@@ -5567,13 +5567,15 @@ class GPUModelRunner(
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
+                or self.speculative_config.use_self_swa()
             ):
                 assert isinstance(
                     self.drafter,
                     EagleProposer
                     | DFlashProposer
                     | DraftModelProposer
-                    | ExtractHiddenStatesProposer,
+                    | ExtractHiddenStatesProposer
+                    | SelfSWAProposer,
                 )
                 assert self.speculative_config is not None
                 # Eagle currently only supports PIECEWISE cudagraphs.
@@ -6406,10 +6408,14 @@ class GPUModelRunner(
         if self.speculative_config and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_extract_hidden_states()
+            or self.speculative_config.use_self_swa()
         ):
             assert isinstance(
                 self.drafter,
-                EagleProposer | DFlashProposer | ExtractHiddenStatesProposer,
+                EagleProposer
+                | DFlashProposer
+                | ExtractHiddenStatesProposer
+                | SelfSWAProposer,
             )
             self.drafter.initialize_cudagraph_keys(cudagraph_mode)
 

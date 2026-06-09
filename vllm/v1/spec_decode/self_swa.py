@@ -82,6 +82,10 @@ class SelfSWAProposer(SpecDecodeBaseProposer):
             pass_hidden_states_to_model=False,
             runner=runner,
         )
+        # self-SWA reuses the target model (and thus its CUDAGraphWrapper), so
+        # the drafter must feed the model from the same persistent buffers the
+        # runner used during cudagraph capture (see _alias_runner_input_buffers).
+        self.runner = runner
         if self.uses_mrope or self.uses_xdrope_dim > 0:
             raise NotImplementedError("self_swa currently supports 1D positions only.")
         if self.parallel_drafting:
@@ -117,6 +121,7 @@ class SelfSWAProposer(SpecDecodeBaseProposer):
 
     def load_model(self, target_model: nn.Module) -> None:
         self.model = target_model
+        self._alias_runner_input_buffers()
         all_attn_layers = get_layers_from_vllm_config(
             self.vllm_config,
             AttentionLayerBase,  # type: ignore[type-abstract]
@@ -134,6 +139,31 @@ class SelfSWAProposer(SpecDecodeBaseProposer):
                 len(self._draft_attn_layer_names),
                 sorted(self._draft_attn_layer_names)[:8],
             )
+
+    def _alias_runner_input_buffers(self) -> None:
+        """Point the drafter's input buffers at the runner's persistent buffers.
+
+        Because self-SWA drafts with the target model, the drafter forward goes
+        through the same CUDAGraphWrapper instances as the runner's main pass.
+        Those wrappers capture cudagraphs bound to the runner's persistent
+        ``input_ids``/``positions`` buffers and replay without copying inputs
+        (``cudagraph_copy_inputs=False``). If the drafter fed the model from its
+        own separate buffers, replay would read stale capture-time memory and
+        silently produce wrong draft tokens (acceptance collapses to ~0). Reusing
+        the runner's buffers keeps capture- and replay-time input addresses
+        identical. This is safe because drafting runs after the target forward
+        and sampling for the step, and the runner re-populates these buffers at
+        the start of the next step.
+        """
+        if self.runner is None:
+            return
+        runner_input_ids = getattr(self.runner, "input_ids", None)
+        runner_positions = getattr(self.runner, "positions", None)
+        if runner_input_ids is None or runner_positions is None:
+            return
+        # runner.input_ids is a CpuGpuBuffer; use its GPU tensor.
+        self.input_ids = runner_input_ids.gpu
+        self.positions = runner_positions
 
     def initialize_attn_backend(
         self,
@@ -305,11 +335,19 @@ class SelfSWAProposer(SpecDecodeBaseProposer):
             self.token_arange_np[: batch_size + 1]
         ).clone()
 
+        # Determine cudagraph mode and padded batch size once; the draft loop
+        # runs one decode token per request so the token count stays batch_size.
+        cudagraph_runtime_mode, input_batch_size, num_tokens_across_dp = (
+            self._determine_batch_execution_and_padding(batch_size)
+        )
+
         draft_token_ids_list: list[torch.Tensor] = []
         for draft_index in range(self.num_speculative_tokens):
             prev_positions = positions.clone() if _debug_enabled() else None
             out_positions = self.positions[:batch_size]
-            out_slot_mapping = self._slot_mapping_buffer[:batch_size]
+            # Pad the slot mapping to input_batch_size so threads beyond
+            # batch_size write PADDING_SLOT_ID (required for cudagraph replay).
+            out_slot_mapping = self._slot_mapping_buffer[:input_batch_size]
             eagle_step_update_slot_mapping_and_metadata(
                 positions_1d=positions,
                 block_table_tensor=common_attn_metadata.block_table_tensor,
@@ -318,6 +356,7 @@ class SelfSWAProposer(SpecDecodeBaseProposer):
                 max_model_len=self.max_model_len,
                 out_clamped_positions=out_positions,
                 out_slot_mapping=out_slot_mapping,
+                input_batch_size=input_batch_size,
             )
             positions = out_positions
             if _debug_enabled():
@@ -356,7 +395,7 @@ class SelfSWAProposer(SpecDecodeBaseProposer):
                     common_attn_metadata.max_seq_len + draft_index + 1,
                     self.max_model_len,
                 ),
-                slot_mapping=out_slot_mapping,
+                slot_mapping=self._slot_mapping_buffer[:batch_size],
                 seq_lens_cpu_upper_bound=None,
                 _seq_lens_cpu=None,
                 _num_computed_tokens_cpu=None,
@@ -406,9 +445,12 @@ class SelfSWAProposer(SpecDecodeBaseProposer):
                 )
 
             self.input_ids[:batch_size] = input_ids
+            # Feed padded buffers to the model for cudagraph replay. Padded rows
+            # beyond batch_size keep stale/zero values; their KV writes are
+            # discarded since out_slot_mapping holds PADDING_SLOT_ID there.
             model_kwargs: dict[str, Any] = {
-                "input_ids": self.input_ids[:batch_size],
-                "positions": positions,
+                "input_ids": self.input_ids[:input_batch_size],
+                "positions": self.positions[:input_batch_size],
                 "inputs_embeds": None,
             }
             slot_mapping = {
@@ -428,7 +470,9 @@ class SelfSWAProposer(SpecDecodeBaseProposer):
             with set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
-                num_tokens=batch_size,
+                num_tokens=input_batch_size,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=slot_mapping,
                 additional_kwargs=additional_kwargs,
             ):
